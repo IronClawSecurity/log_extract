@@ -2,7 +2,17 @@
 #include "collectors/applog.h"
 #include <dirent.h>
 
-#ifndef _WIN32
+#ifdef __APPLE__
+static const char *wellknown_dirs[] = {
+    "/var/log/apache2",
+    "/private/var/log/apache2",
+    "/opt/homebrew/var/log/nginx",
+    "/usr/local/var/log/nginx",
+    "/opt/homebrew/var/log/httpd",
+    "/usr/local/var/log/httpd",
+    NULL
+};
+#elif !defined(_WIN32)
 static const char *wellknown_dirs[] = {
     "/var/log/apache2",
     "/var/log/httpd",

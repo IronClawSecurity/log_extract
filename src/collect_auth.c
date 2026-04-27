@@ -3,15 +3,25 @@
 
 #ifndef _WIN32
 
-#include <pwd.h>
 #include <unistd.h>
-#include <utmpx.h>
 
+#ifndef __APPLE__
+#include <pwd.h>
+#include <utmpx.h>
+#endif
+
+#ifdef __APPLE__
+static const char *auth_log_paths[] = {
+    "/var/log/system.log",
+    NULL
+};
+#else
 static const char *auth_log_paths[] = {
     "/var/log/auth.log",
     "/var/log/secure",
     NULL
 };
+#endif
 
 /* Parse syslog-style timestamp from auth log line */
 static time_t parse_auth_time(const char *line)
@@ -63,6 +73,20 @@ static long collect_auth_text(const char *path, const filter_config_t *filter,
         t = parse_auth_time(line);
         if (!filter_match_time(filter, t)) continue;
         if (!filter_match_line(filter, line)) continue;
+
+#ifdef __APPLE__
+        /* On macOS system.log, only include auth-related lines */
+        if (!str_contains(line, "sshd") &&
+            !str_contains(line, "sudo") &&
+            !str_contains(line, "login") &&
+            !str_contains(line, "auth") &&
+            !str_contains(line, "screensharingd") &&
+            !str_contains(line, "SecurityAgent") &&
+            !str_contains(line, "authorization") &&
+            !str_contains(line, "passwd"))
+            continue;
+#endif
+
         fputs(line, out);
         count++;
     }
@@ -71,6 +95,8 @@ static long collect_auth_text(const char *path, const filter_config_t *filter,
     return count;
 }
 
+#ifndef __APPLE__
+/* Linux-only: wtmp/btmp binary parsing */
 static const char *utmp_type_str(short type)
 {
     switch (type) {
@@ -105,7 +131,6 @@ static long collect_wtmp(const char *path, const filter_config_t *filter,
                 continue;
         }
 
-        /* Keyword filter on formatted line */
         plat_format_timestamp(t, timebuf, sizeof(timebuf));
 
         fprintf(out, "%-12s %-8s %-12s %-16s %s\n",
@@ -120,6 +145,7 @@ static long collect_wtmp(const char *path, const filter_config_t *filter,
     fclose(in);
     return count;
 }
+#endif /* !__APPLE__ */
 
 int collect_auth_init(collector_t *self, const filter_config_t *filter,
                       const char *output_dir)
@@ -137,8 +163,15 @@ int collect_auth_init(collector_t *self, const filter_config_t *filter,
             break;
         }
     }
+
+#ifdef __APPLE__
+    /* macOS: 'last' command and Unified Logging are always available */
+    if (plat_file_exists("/usr/bin/last")) found = 1;
+    if (plat_file_exists("/usr/bin/log")) found = 1;
+#else
     if (plat_file_exists("/var/log/wtmp")) found = 1;
     if (plat_file_exists("/var/log/btmp")) found = 1;
+#endif
 
     if (!found) {
         self->status = 2;
@@ -196,6 +229,98 @@ int collect_auth_run(collector_t *self)
         }
     }
 
+#ifdef __APPLE__
+    /* macOS: capture 'last' command output (login history) */
+    {
+        char out_file[MAX_PATH_LEN];
+        int ret;
+
+        plat_path_join(out_file, sizeof(out_file), self->out_path, "last.txt");
+
+        if (self->filter->username[0] && str_is_shell_safe(self->filter->username)) {
+            char cmd[MAX_PATH_LEN];
+            snprintf(cmd, sizeof(cmd), "last '%s'", self->filter->username);
+            ret = plat_exec_capture(cmd, out_file);
+        } else {
+            ret = plat_exec_capture("last", out_file);
+        }
+
+        if (ret == 0) {
+            FILE *f = fopen(out_file, "r");
+            if (f) {
+                char line[MAX_LINE_LEN];
+                long n = 0;
+                while (fgets(line, sizeof(line), f)) n++;
+                fclose(f);
+                total += n;
+                log_verbose("auth: %ld lines from last", n);
+            }
+        }
+    }
+
+    /* macOS: Unified Logging auth events */
+    if (plat_file_exists("/usr/bin/log")) {
+        char cmd[MAX_PATH_LEN * 2];
+        char out_file[MAX_PATH_LEN];
+        int ret;
+        long n;
+
+        plat_path_join(out_file, sizeof(out_file), self->out_path, "auth_unified.log");
+
+        snprintf(cmd, sizeof(cmd),
+                 "log show --style compact --predicate "
+                 "'process == \"loginwindow\" OR process == \"sshd\" "
+                 "OR process == \"sudo\" OR process == \"screensharingd\" "
+                 "OR process == \"SecurityAgent\"'");
+
+        {
+            int has_time = 0;
+            if (self->filter->time_start) {
+                char ts[32];
+                plat_format_timestamp(self->filter->time_start, ts, sizeof(ts));
+                if (str_is_shell_safe(ts)) {
+                    snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
+                             " --start '%s'", ts);
+                    has_time = 1;
+                }
+            }
+            if (self->filter->time_end) {
+                char ts[32];
+                plat_format_timestamp(self->filter->time_end, ts, sizeof(ts));
+                if (str_is_shell_safe(ts)) {
+                    snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
+                             " --end '%s'", ts);
+                    has_time = 1;
+                }
+            }
+            if (!has_time)
+                snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), " --last 1d");
+        }
+
+        log_verbose("auth: running %s", cmd);
+        ret = plat_exec_capture(cmd, out_file);
+        if (ret == 0) {
+            FILE *f = fopen(out_file, "r");
+            if (f) {
+                char line[MAX_LINE_LEN];
+                n = 0;
+                while (fgets(line, sizeof(line), f)) {
+                    if (self->filter->username[0] &&
+                        !str_contains(line, self->filter->username))
+                        continue;
+                    n++;
+                }
+                fclose(f);
+                total += n;
+                log_verbose("auth: %ld lines from Unified Logging", n);
+            }
+        } else {
+            log_verbose("auth: log show returned %d", ret);
+        }
+    }
+
+#else /* Linux */
+
     /* wtmp */
     if (plat_file_exists("/var/log/wtmp")) {
         char out_file[MAX_PATH_LEN];
@@ -245,6 +370,8 @@ int collect_auth_run(collector_t *self)
         }
     }
 
+#endif /* __APPLE__ / Linux */
+
     self->lines_collected = total;
     if (total == 0) {
         self->status = 2;
@@ -261,9 +388,6 @@ void collect_auth_cleanup(collector_t *self)
 
 #else /* _WIN32 */
 
-/* Windows auth collection via Security Event Log */
-/* Implemented in collect_eventlog.c helper functions */
-
 int collect_auth_init(collector_t *self, const filter_config_t *filter,
                       const char *output_dir)
 {
@@ -279,8 +403,6 @@ int collect_auth_init(collector_t *self, const filter_config_t *filter,
 
 int collect_auth_run(collector_t *self)
 {
-    /* Windows implementation uses Evt* API — see collect_eventlog.c */
-    /* This is a stub that will be filled in when Windows support is built */
     self->status = 2;
     snprintf(self->status_msg, sizeof(self->status_msg),
              "Windows auth collection not yet implemented");

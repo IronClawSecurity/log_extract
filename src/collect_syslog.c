@@ -3,11 +3,19 @@
 #include "log_extract.h"
 #include "collectors/syslog.h"
 
+#ifdef __APPLE__
+static const char *syslog_paths[] = {
+    "/var/log/system.log",
+    "/var/log/install.log",
+    NULL
+};
+#else
 static const char *syslog_paths[] = {
     "/var/log/syslog",
     "/var/log/messages",
     NULL
 };
+#endif
 
 /* Parse syslog timestamp: "Mon DD HH:MM:SS" from start of line */
 static time_t parse_syslog_time(const char *line)
@@ -87,14 +95,28 @@ int collect_syslog_init(collector_t *self, const filter_config_t *filter,
                         const char *output_dir)
 {
     char subdir[MAX_PATH_LEN];
+    int found = 0;
+    int i;
 
     self->filter = filter;
     plat_path_join(self->out_path, sizeof(self->out_path), output_dir, self->subdir);
 
     /* Check if at least one source exists */
-    if (!plat_file_exists("/var/log/syslog") &&
-        !plat_file_exists("/var/log/messages") &&
-        !plat_is_directory("/run/log/journal")) {
+    for (i = 0; syslog_paths[i]; i++) {
+        if (plat_file_exists(syslog_paths[i])) {
+            found = 1;
+            break;
+        }
+    }
+
+#ifdef __APPLE__
+    /* macOS Unified Logging is always available on 10.12+ */
+    if (plat_file_exists("/usr/bin/log")) found = 1;
+#else
+    if (plat_is_directory("/run/log/journal")) found = 1;
+#endif
+
+    if (!found) {
         self->status = 2;
         snprintf(self->status_msg, sizeof(self->status_msg), "no syslog sources found");
         return -1;
@@ -108,6 +130,68 @@ int collect_syslog_init(collector_t *self, const filter_config_t *filter,
     }
 
     return 0;
+}
+
+/* Helper: build a macOS 'log show' or Linux 'journalctl' command with time filters.
+ * If no time range is specified on macOS, defaults to --last 1d to avoid
+ * scanning the entire Unified Logging store (which can take minutes). */
+static int build_log_command(char *cmd, size_t cmdsz, const filter_config_t *filter,
+                             const char *base_cmd, const char *start_flag,
+                             const char *end_flag)
+{
+    int has_time = 0;
+
+    snprintf(cmd, cmdsz, "%s", base_cmd);
+
+    if (filter->time_start) {
+        char ts[32];
+        plat_format_timestamp(filter->time_start, ts, sizeof(ts));
+        if (str_is_shell_safe(ts)) {
+            snprintf(cmd + strlen(cmd), cmdsz - strlen(cmd),
+                     " %s '%s'", start_flag, ts);
+            has_time = 1;
+        }
+    }
+    if (filter->time_end) {
+        char ts[32];
+        plat_format_timestamp(filter->time_end, ts, sizeof(ts));
+        if (str_is_shell_safe(ts)) {
+            snprintf(cmd + strlen(cmd), cmdsz - strlen(cmd),
+                     " %s '%s'", end_flag, ts);
+            has_time = 1;
+        }
+    }
+
+#ifdef __APPLE__
+    /* Default to last 24h if no time range specified, to avoid full store scan */
+    if (!has_time) {
+        snprintf(cmd + strlen(cmd), cmdsz - strlen(cmd), " --last 1d");
+    }
+#else
+    (void)has_time;
+#endif
+
+    return 0;
+}
+
+/* Count lines in a file, optionally applying keyword filter */
+static long count_filtered_lines(const char *path, const filter_config_t *filter)
+{
+    FILE *f = fopen(path, "r");
+    char line[MAX_LINE_LEN];
+    long count = 0;
+
+    if (!f) return 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (filter->keyword[0] && !str_contains(line, filter->keyword))
+            continue;
+        if (filter->username[0] && !str_contains(line, filter->username))
+            continue;
+        count++;
+    }
+    fclose(f);
+    return count;
 }
 
 int collect_syslog_run(collector_t *self)
@@ -150,33 +234,46 @@ int collect_syslog_run(collector_t *self)
         }
     }
 
-    /* Try journalctl if available */
+#ifdef __APPLE__
+    /* macOS Unified Logging via 'log show' */
+    if (plat_file_exists("/usr/bin/log")) {
+        char cmd[MAX_PATH_LEN * 2];
+        char unified_out[MAX_PATH_LEN];
+        int ret;
+        long n;
+
+        plat_path_join(unified_out, sizeof(unified_out), self->out_path,
+                       "unified.log");
+
+        build_log_command(cmd, sizeof(cmd), self->filter,
+                          "log show --style compact --info",
+                          "--start", "--end");
+
+        log_verbose("syslog: running %s", cmd);
+        ret = plat_exec_capture(cmd, unified_out);
+        if (ret != 0) {
+            log_verbose("syslog: log show returned %d", ret);
+        } else {
+            n = count_filtered_lines(unified_out, self->filter);
+            total += n;
+            log_verbose("syslog: %ld lines from Unified Logging", n);
+        }
+    }
+#else
+    /* Linux: try journalctl if systemd journal is available */
     if (plat_is_directory("/run/log/journal")) {
-        char cmd[MAX_PATH_LEN];
+        char cmd[MAX_PATH_LEN * 2];
         char journal_out[MAX_PATH_LEN];
         int ret;
+        long n;
 
         plat_path_join(journal_out, sizeof(journal_out), self->out_path,
                        "journald.log");
 
-        snprintf(cmd, sizeof(cmd), "journalctl --no-pager -o short-iso");
+        build_log_command(cmd, sizeof(cmd), self->filter,
+                          "journalctl --no-pager -o short-iso",
+                          "--since", "--until");
 
-        if (self->filter->time_start) {
-            char ts[32];
-            plat_format_timestamp(self->filter->time_start, ts, sizeof(ts));
-            if (str_is_shell_safe(ts)) {
-                snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
-                         " --since '%s'", ts);
-            }
-        }
-        if (self->filter->time_end) {
-            char ts[32];
-            plat_format_timestamp(self->filter->time_end, ts, sizeof(ts));
-            if (str_is_shell_safe(ts)) {
-                snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
-                         " --until '%s'", ts);
-            }
-        }
         if (self->filter->username[0]) {
             if (str_is_shell_safe(self->filter->username)) {
                 snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
@@ -192,23 +289,12 @@ int collect_syslog_run(collector_t *self)
         if (ret != 0) {
             log_verbose("syslog: journalctl returned %d", ret);
         } else {
-            /* Count lines in output */
-            FILE *f = fopen(journal_out, "r");
-            if (f) {
-                char line[MAX_LINE_LEN];
-                long jcount = 0;
-                while (fgets(line, sizeof(line), f)) {
-                    if (self->filter->keyword[0] &&
-                        !str_contains(line, self->filter->keyword))
-                        continue;
-                    jcount++;
-                }
-                fclose(f);
-                total += jcount;
-                log_verbose("syslog: %ld lines from journald", jcount);
-            }
+            n = count_filtered_lines(journal_out, self->filter);
+            total += n;
+            log_verbose("syslog: %ld lines from journald", n);
         }
     }
+#endif
 
     self->lines_collected = total;
     if (total == 0) {

@@ -3,17 +3,24 @@
 
 #ifndef _WIN32
 
+#ifndef __APPLE__
 #include <pwd.h>
+#endif
 
+#ifdef __APPLE__
+static const char *audit_dir = "/var/audit";
+#else
 static const char *audit_path = "/var/log/audit/audit.log";
+#endif
 
-/* Parse auditd timestamp from: type=X msg=audit(EPOCH.MS:SERIAL): ... */
+#ifndef __APPLE__
+/* Linux: parse auditd timestamp from: type=X msg=audit(EPOCH.MS:SERIAL): ... */
 static time_t parse_audit_time(const char *line)
 {
     const char *p = strstr(line, "audit(");
     double ts;
     if (!p) return 0;
-    p += 6; /* skip "audit(" */
+    p += 6;
     if (sscanf(p, "%lf", &ts) != 1) return 0;
     return (time_t)ts;
 }
@@ -37,6 +44,7 @@ static int is_file_audit_event(const char *line)
            str_contains(line, "type=CWD") ||
            str_contains(line, "type=PROCTITLE");
 }
+#endif /* !__APPLE__ */
 
 int collect_filemon_init(collector_t *self, const filter_config_t *filter,
                          const char *output_dir)
@@ -44,12 +52,21 @@ int collect_filemon_init(collector_t *self, const filter_config_t *filter,
     self->filter = filter;
     plat_path_join(self->out_path, sizeof(self->out_path), output_dir, self->subdir);
 
+#ifdef __APPLE__
+    if (!plat_is_directory(audit_dir) && !plat_file_exists("/usr/bin/log")) {
+        self->status = 2;
+        snprintf(self->status_msg, sizeof(self->status_msg),
+                 "no audit sources found (need /var/audit/ or Unified Logging)");
+        return -1;
+    }
+#else
     if (!plat_file_exists(audit_path)) {
         self->status = 2;
         snprintf(self->status_msg, sizeof(self->status_msg),
                  "auditd log not found (%s)", audit_path);
         return -1;
     }
+#endif
 
     if (plat_mkdir_p(self->out_path) != 0) {
         self->status = 3;
@@ -62,67 +79,194 @@ int collect_filemon_init(collector_t *self, const filter_config_t *filter,
 
 int collect_filemon_run(collector_t *self)
 {
-    FILE *in, *out;
-    char line[MAX_LINE_LEN];
-    char out_file[MAX_PATH_LEN];
-    char uid_str[32] = {0};
     long total = 0;
-    time_t t;
 
-    /* If user filter is set, resolve username to UID */
-    if (self->filter->username[0]) {
-        struct passwd *pw = getpwnam(self->filter->username);
-        if (pw) {
-            snprintf(uid_str, sizeof(uid_str), "%d", pw->pw_uid);
-            log_verbose("filemon: resolved user '%s' to uid %s",
-                        self->filter->username, uid_str);
+#ifdef __APPLE__
+    /* macOS: use praudit to parse OpenBSM audit trails */
+    if (plat_is_directory(audit_dir)) {
+        char cmd[MAX_PATH_LEN * 2];
+        char out_file[MAX_PATH_LEN];
+        int ret;
+
+        plat_path_join(out_file, sizeof(out_file), self->out_path, "openbsm_audit.txt");
+
+        snprintf(cmd, sizeof(cmd), "praudit -l /var/audit/* 2>/dev/null");
+
+        log_verbose("filemon: running %s", cmd);
+        ret = plat_exec_capture(cmd, out_file);
+
+        if (ret == 0 || plat_file_exists(out_file)) {
+            /* Post-filter the output */
+            FILE *in = fopen(out_file, "r");
+            if (in) {
+                char filtered_path[MAX_PATH_LEN];
+                FILE *filtered;
+                char line[MAX_LINE_LEN];
+                long n = 0;
+
+                plat_path_join(filtered_path, sizeof(filtered_path),
+                               self->out_path, "audit_filtered.txt");
+                filtered = fopen(filtered_path, "w");
+
+                if (filtered) {
+                    while (fgets(line, sizeof(line), in)) {
+                        /* Only file-related events */
+                        if (!str_contains(line, "open") &&
+                            !str_contains(line, "unlink") &&
+                            !str_contains(line, "rename") &&
+                            !str_contains(line, "chmod") &&
+                            !str_contains(line, "chown") &&
+                            !str_contains(line, "write") &&
+                            !str_contains(line, "create"))
+                            continue;
+
+                        if (!filter_match_line(self->filter, line)) continue;
+
+                        fputs(line, filtered);
+                        n++;
+                    }
+                    fclose(filtered);
+                }
+                fclose(in);
+
+                /* Remove the unfiltered raw dump, keep filtered version */
+                remove(out_file);
+
+                total += n;
+                log_verbose("filemon: %ld entries from OpenBSM audit", n);
+            }
         } else {
-            log_warn("filemon: cannot resolve user '%s' — "
-                     "will fall back to string matching", self->filter->username);
+            log_warn("filemon: praudit failed (permission denied?)");
+            self->status = 1;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "partial: praudit failed");
         }
     }
 
-    in = fopen(audit_path, "r");
-    if (!in) {
-        self->status = 1;
-        snprintf(self->status_msg, sizeof(self->status_msg),
-                 "permission denied: %s", audit_path);
-        return -1;
+    /* macOS: Unified Logging for file events */
+    if (plat_file_exists("/usr/bin/log")) {
+        char cmd[MAX_PATH_LEN * 2];
+        char out_file[MAX_PATH_LEN];
+        int ret;
+
+        plat_path_join(out_file, sizeof(out_file), self->out_path,
+                       "filemon_unified.log");
+
+        snprintf(cmd, sizeof(cmd),
+                 "log show --style compact --predicate "
+                 "'process == \"kernel\" AND (eventMessage CONTAINS \"open\" "
+                 "OR eventMessage CONTAINS \"unlink\" "
+                 "OR eventMessage CONTAINS \"rename\")'");
+
+        {
+            int has_time = 0;
+            if (self->filter->time_start) {
+                char ts[32];
+                plat_format_timestamp(self->filter->time_start, ts, sizeof(ts));
+                if (str_is_shell_safe(ts)) {
+                    snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
+                             " --start '%s'", ts);
+                    has_time = 1;
+                }
+            }
+            if (self->filter->time_end) {
+                char ts[32];
+                plat_format_timestamp(self->filter->time_end, ts, sizeof(ts));
+                if (str_is_shell_safe(ts)) {
+                    snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
+                             " --end '%s'", ts);
+                    has_time = 1;
+                }
+            }
+            if (!has_time)
+                snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), " --last 1d");
+        }
+
+        log_verbose("filemon: running %s", cmd);
+        ret = plat_exec_capture(cmd, out_file);
+        if (ret == 0) {
+            FILE *f = fopen(out_file, "r");
+            if (f) {
+                char line[MAX_LINE_LEN];
+                long n = 0;
+                while (fgets(line, sizeof(line), f)) {
+                    if (self->filter->username[0] &&
+                        !str_contains(line, self->filter->username))
+                        continue;
+                    n++;
+                }
+                fclose(f);
+                total += n;
+                log_verbose("filemon: %ld lines from Unified Logging", n);
+            }
+        }
     }
 
-    plat_path_join(out_file, sizeof(out_file), self->out_path, "audit.log");
-    out = fopen(out_file, "w");
-    if (!out) {
+#else /* Linux */
+
+    {
+        FILE *in, *out;
+        char line[MAX_LINE_LEN];
+        char out_file[MAX_PATH_LEN];
+        char uid_str[32] = {0};
+        time_t t;
+
+        /* If user filter is set, resolve username to UID */
+        if (self->filter->username[0]) {
+            struct passwd *pw = getpwnam(self->filter->username);
+            if (pw) {
+                snprintf(uid_str, sizeof(uid_str), "%d", pw->pw_uid);
+                log_verbose("filemon: resolved user '%s' to uid %s",
+                            self->filter->username, uid_str);
+            } else {
+                log_warn("filemon: cannot resolve user '%s' — "
+                         "will fall back to string matching",
+                         self->filter->username);
+            }
+        }
+
+        in = fopen(audit_path, "r");
+        if (!in) {
+            self->status = 1;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "permission denied: %s", audit_path);
+            goto done;
+        }
+
+        plat_path_join(out_file, sizeof(out_file), self->out_path, "audit.log");
+        out = fopen(out_file, "w");
+        if (!out) {
+            fclose(in);
+            self->status = 3;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "cannot write output file");
+            goto done;
+        }
+
+        while (fgets(line, sizeof(line), in)) {
+            if (!is_file_audit_event(line)) continue;
+
+            t = parse_audit_time(line);
+            if (!filter_match_time(self->filter, t)) continue;
+
+            if (uid_str[0] && !audit_matches_uid(line, uid_str)) continue;
+
+            if (!filter_match_keyword(self->filter, line)) continue;
+
+            fputs(line, out);
+            total++;
+        }
+
         fclose(in);
-        self->status = 3;
-        snprintf(self->status_msg, sizeof(self->status_msg),
-                 "cannot write output file");
-        return -1;
+        fclose(out);
     }
 
-    while (fgets(line, sizeof(line), in)) {
-        /* Only file-access related events */
-        if (!is_file_audit_event(line)) continue;
+done:
 
-        /* Time filter */
-        t = parse_audit_time(line);
-        if (!filter_match_time(self->filter, t)) continue;
-
-        /* User filter by UID */
-        if (uid_str[0] && !audit_matches_uid(line, uid_str)) continue;
-
-        /* Keyword filter */
-        if (!filter_match_keyword(self->filter, line)) continue;
-
-        fputs(line, out);
-        total++;
-    }
-
-    fclose(in);
-    fclose(out);
+#endif /* __APPLE__ / Linux */
 
     self->lines_collected = total;
-    if (total == 0) {
+    if (total == 0 && self->status == 0) {
         self->status = 2;
         snprintf(self->status_msg, sizeof(self->status_msg), "no matching entries");
     }
@@ -152,7 +296,6 @@ int collect_filemon_init(collector_t *self, const filter_config_t *filter,
 
 int collect_filemon_run(collector_t *self)
 {
-    /* TODO: query Security event log for EventIDs 4663/4656/4660/4670 */
     self->status = 2;
     snprintf(self->status_msg, sizeof(self->status_msg),
              "Windows file audit collection not yet implemented");
