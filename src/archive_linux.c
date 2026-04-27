@@ -24,7 +24,14 @@ int archive_create(const char *output_dir, char *archive_path, size_t bufsz)
 
     snprintf(archive_path, bufsz, "%s.tar.gz", output_dir);
 
-    snprintf(cmd, sizeof(cmd), "tar czf \"%s\" -C \"%s\" \"%s\"",
+    /* Validate path components before passing to shell */
+    if (!str_is_shell_safe(archive_path) || !str_is_shell_safe(parent) ||
+        !str_is_shell_safe(dirname)) {
+        log_error("archive: output path contains unsafe characters");
+        return -1;
+    }
+
+    snprintf(cmd, sizeof(cmd), "tar czf '%s' -C '%s' '%s'",
              archive_path, parent, dirname);
 
     log_verbose("archive: running %s", cmd);

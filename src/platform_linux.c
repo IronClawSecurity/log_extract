@@ -62,9 +62,12 @@ int plat_file_copy(const char *src, const char *dst)
         }
     }
 
-    fclose(in);
-    fclose(out);
-    return 0;
+    {
+        int err = ferror(in);
+        fclose(in);
+        fclose(out);
+        return err ? -1 : 0;
+    }
 }
 
 int plat_file_exists(const char *path)

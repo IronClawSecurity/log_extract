@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -pedantic -std=c99 -Iinclude
+CFLAGS = -Wall -Wextra -pedantic -std=c99 -D_DEFAULT_SOURCE -Iinclude
 LDFLAGS =
 
 # Common sources (compiled on all platforms)
@@ -30,7 +30,7 @@ build:
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-build/%.o: src/%.c
+build/%.o: src/%.c | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

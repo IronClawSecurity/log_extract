@@ -21,4 +21,9 @@ int str_contains(const char *haystack, const char *needle);
 int str_starts_with(const char *str, const char *prefix);
 void str_trim(char *s);
 
+/* Shell safety: validate a string contains only safe characters (alphanum, -, _, .) */
+int str_is_shell_safe(const char *s);
+/* Shell safety: escape a string for use in shell commands */
+int str_shell_escape(const char *src, char *dst, size_t dstsz);
+
 #endif /* UTIL_H */

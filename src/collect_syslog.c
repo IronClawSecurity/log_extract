@@ -164,18 +164,27 @@ int collect_syslog_run(collector_t *self)
         if (self->filter->time_start) {
             char ts[32];
             plat_format_timestamp(self->filter->time_start, ts, sizeof(ts));
-            snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
-                     " --since \"%s\"", ts);
+            if (str_is_shell_safe(ts)) {
+                snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
+                         " --since '%s'", ts);
+            }
         }
         if (self->filter->time_end) {
             char ts[32];
             plat_format_timestamp(self->filter->time_end, ts, sizeof(ts));
-            snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
-                     " --until \"%s\"", ts);
+            if (str_is_shell_safe(ts)) {
+                snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
+                         " --until '%s'", ts);
+            }
         }
         if (self->filter->username[0]) {
-            snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
-                     " _COMM=%s", self->filter->username);
+            if (str_is_shell_safe(self->filter->username)) {
+                snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd),
+                         " _COMM='%s'", self->filter->username);
+            } else {
+                log_warn("syslog: username contains unsafe characters, "
+                         "skipping journalctl user filter");
+            }
         }
 
         log_verbose("syslog: running %s", cmd);

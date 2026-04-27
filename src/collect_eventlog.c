@@ -185,8 +185,11 @@ int collect_eventlog_run(collector_t *self)
         WideCharToMultiByte(CP_UTF8, 0, channels[i], -1,
                            channel_name, sizeof(channel_name), NULL, NULL);
 
-        plat_path_join(out_file, sizeof(out_file), self->out_path, channel_name);
-        strncat(out_file, ".xml", sizeof(out_file) - strlen(out_file) - 1);
+        {
+            char fname[72];
+            snprintf(fname, sizeof(fname), "%s.xml", channel_name);
+            plat_path_join(out_file, sizeof(out_file), self->out_path, fname);
+        }
 
         out = fopen(out_file, "w");
         if (!out) {

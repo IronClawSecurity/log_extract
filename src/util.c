@@ -73,8 +73,11 @@ char *safe_strdup(const char *s)
 {
     char *d;
     if (!s) return NULL;
-    d = safe_malloc(strlen(s) + 1);
-    strcpy(d, s);
+    {
+        size_t len = strlen(s) + 1;
+        d = safe_malloc(len);
+        memcpy(d, s, len);
+    }
     return d;
 }
 
@@ -108,4 +111,41 @@ void str_trim(char *s)
     if (start != s)
         memmove(s, start, (size_t)(end - start));
     s[end - start] = '\0';
+}
+
+int str_is_shell_safe(const char *s)
+{
+    if (!s) return 0;
+    for (; *s; s++) {
+        if ((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
+            (*s >= '0' && *s <= '9') || *s == '-' || *s == '_' ||
+            *s == '.' || *s == '/' || *s == ':' || *s == ' ')
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+int str_shell_escape(const char *src, char *dst, size_t dstsz)
+{
+    size_t di = 0;
+    if (dstsz < 3) return -1;
+
+    dst[di++] = '\'';
+    for (; *src && di < dstsz - 2; src++) {
+        if (*src == '\'') {
+            /* End quote, escaped quote, restart quote: '\'' */
+            if (di + 4 >= dstsz) return -1;
+            dst[di++] = '\'';
+            dst[di++] = '\\';
+            dst[di++] = '\'';
+            dst[di++] = '\'';
+        } else {
+            dst[di++] = *src;
+        }
+    }
+    if (*src) return -1;  /* truncated */
+    dst[di++] = '\'';
+    dst[di] = '\0';
+    return 0;
 }
