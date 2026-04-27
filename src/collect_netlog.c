@@ -1,5 +1,6 @@
 #include "log_extract.h"
 #include "collectors/netlog.h"
+#include "jsonl.h"
 
 #ifndef _WIN32
 
@@ -19,7 +20,7 @@ static const char *netlog_paths[] = {
 #endif
 
 static long collect_text_filtered(const char *path, const filter_config_t *filter,
-                                  FILE *out)
+                                  FILE *out, FILE *jsonl_f, const char *src_name)
 {
     FILE *in;
     char line[MAX_LINE_LEN];
@@ -31,6 +32,12 @@ static long collect_text_filtered(const char *path, const filter_config_t *filte
     while (fgets(line, sizeof(line), in)) {
         if (!filter_match_line(filter, line)) continue;
         fputs(line, out);
+        if (jsonl_f) {
+            char trimmed[MAX_LINE_LEN];
+            snprintf(trimmed, sizeof(trimmed), "%s", line);
+            str_trim(trimmed);
+            jsonl_emit(jsonl_f, src_name, 0, -1, NULL, trimmed);
+        }
         count++;
     }
 
@@ -114,30 +121,32 @@ int collect_netlog_run(collector_t *self)
 
     /* Collect text-based log files */
     for (i = 0; netlog_paths[i]; i++) {
+        char out_file[MAX_PATH_LEN];
+        const char *basename;
+        FILE *out, *jsonl_f;
+        long n;
+
         if (!plat_file_exists(netlog_paths[i])) continue;
 
-        {
-            char out_file[MAX_PATH_LEN];
-            const char *basename = strrchr(netlog_paths[i], '/');
-            FILE *out;
-            long n;
+        basename = strrchr(netlog_paths[i], '/');
+        basename = basename ? basename + 1 : netlog_paths[i];
+        plat_path_join(out_file, sizeof(out_file), self->out_path, basename);
 
-            basename = basename ? basename + 1 : netlog_paths[i];
-            plat_path_join(out_file, sizeof(out_file), self->out_path, basename);
+        out = fopen(out_file, "w");
+        if (!out) continue;
 
-            out = fopen(out_file, "w");
-            if (!out) continue;
+        jsonl_f = jsonl_open(self->out_path, basename);
+        n = collect_text_filtered(netlog_paths[i], self->filter, out, jsonl_f,
+                                  basename);
+        fclose(out);
+        jsonl_close(jsonl_f);
 
-            n = collect_text_filtered(netlog_paths[i], self->filter, out);
-            fclose(out);
-
-            if (n > 0) {
-                total += n;
-                log_verbose("network: %ld lines from %s", n, netlog_paths[i]);
-            } else if (n < 0) {
-                log_warn("network: cannot read %s", netlog_paths[i]);
-                self->status = 1;
-            }
+        if (n > 0) {
+            total += n;
+            log_verbose("network: %ld lines from %s", n, netlog_paths[i]);
+        } else if (n < 0) {
+            log_warn("network: cannot read %s", netlog_paths[i]);
+            self->status = 1;
         }
     }
 

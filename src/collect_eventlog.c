@@ -130,6 +130,14 @@ static long query_channel(const wchar_t *channel, const filter_config_t *filter,
                 EvtClose(events[i]);
                 continue;
             }
+            if (filter->exclude[0]) {
+                wchar_t wexcl[256];
+                MultiByteToWideChar(CP_UTF8, 0, filter->exclude, -1, wexcl, 256);
+                if (wcsstr(rendered, wexcl) != NULL) {
+                    EvtClose(events[i]);
+                    continue;
+                }
+            }
 
             /* Write XML to output as UTF-8 */
             {

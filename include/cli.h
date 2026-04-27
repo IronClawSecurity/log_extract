@@ -8,12 +8,15 @@ typedef struct {
     int   collect_app;
     int   collect_network;
     int   collect_filemon;
+    int   collect_snapshot;
+    int   collect_persistence;
     int   collect_all;
 
     /* Filters */
     char  time_start[32];
     char  time_end[32];
     char  keyword[256];
+    char  exclude[256];
     int   severity_min;
     int   severity_max;
     char  username[128];
@@ -22,6 +25,12 @@ typedef struct {
     char  *app_paths[32];
     int    app_path_count;
 
+    /* macOS fs_usage live capture duration (seconds). 0 = disabled. */
+    int   fs_usage_secs;
+
+    /* Network target (SSH-based remote collection). Empty = local mode. */
+    char  target[256];
+
     /* Output */
     char  output_dir[1024];
     int   verbose;
@@ -29,6 +38,7 @@ typedef struct {
     int   dry_run;
     int   no_archive;
     int   no_hash;
+    int   jsonl;
     int   show_help;
     int   show_version;
 } cli_options_t;

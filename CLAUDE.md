@@ -37,6 +37,20 @@ A collector communicates results back through fields on its own `collector_t` st
 4. Add the source file to `SRC_COMMON` (or the platform-specific list) in the `Makefile`
 5. If it needs CLI flags, extend `cli_options_t` in `include/cli.h`, parse in `src/cli.c`, and wire enabling in `enable_collectors()` in `src/main.c`
 
+The `snapshot` and `persistence` collectors are pure shell-out collectors: they iterate a static table of `{out_name, cmd}` pairs and call `plat_exec_capture` for each. They do not apply line-level filters. When extending these tables, every entry is best-effort — non-zero exit codes are logged but not treated as collector-level errors, since most commands depend on optional system tooling.
+
+### JSONL sidecars
+
+When `--jsonl` is set, line-oriented collectors (syslog, auth, applog, netlog) open a `<source>.jsonl` sibling alongside each raw text file via `jsonl_open()` (see `include/jsonl.h`). For every line that passes filtering, they call `jsonl_emit()` with `(source, timestamp, severity, user, message)` — any of those fields may be empty/zero. The text output is preserved unchanged for forensic fidelity. To extend a collector with JSONL support, follow the existing pattern in `collect_syslog.c::collect_text_file()` — accept a `FILE *jsonl_f` parameter and call `jsonl_emit` next to each `fputs(line, out)`.
+
+### Manifest
+
+`manifest_write()` (`src/manifest.c`) is called from `main.c` AFTER all collectors run but BEFORE `archive_create()`, so the manifest is captured inside the archive. It walks the output directory recursively, hashes every collected file with `hash_sha256_file`, and serialises that plus tool/host/CLI metadata as JSON. The recursive walk has separate POSIX `dirent` and Win32 `FindFirstFile` paths in the same file.
+
+### Remote-target mode
+
+`remote_run()` (`src/remote.c`, POSIX-only) implements `--target user@host`. Flow: ssh-create staging dir on remote, scp the local binary up, ssh-exec it with our argv minus `--target`/`-o`, scp the resulting hostname directory back, then ssh-rm the staging dir. The target string is validated by an allowlist (alnum + `@-_.:`) before any shell interpolation. The local binary path is taken from `argv[0]`; users must invoke with an absolute or accessible path. Requires `ssh` and `scp` on `PATH` and key-based auth (BatchMode=yes prevents password prompts).
+
 ### Platform isolation
 
 Cross-platform code lives in common files. Platform-specific code is split three ways:
@@ -66,7 +80,9 @@ The codebase compiles with `-std=c99 -pedantic` and depends on **only** libc + p
 
 ### Shell-safety for `system()` calls
 
-Several collectors shell out (`journalctl`, `log show`, `praudit`, `tar`). All user-controlled strings going into shell commands **must** be validated with `str_is_shell_safe()` (alphanumerics, `-_./: `, space) before being interpolated, or escaped with `str_shell_escape()`. See `collect_syslog.c` `build_log_command()` and `archive_linux.c` for the pattern. Never pass `filter->username`, `filter->keyword`, or paths to shell without one of these.
+Several collectors shell out (`journalctl`, `log show`, `praudit`, `tar`, `ssh`, `scp`). All user-controlled strings going into shell commands **must** be validated with `str_is_shell_safe()` (alphanumerics, `-_./: `, space) before being interpolated, or escaped with `str_shell_escape()`. See `collect_syslog.c::build_log_command()`, `archive_linux.c`, and `remote.c::quote_arg()` for the pattern. Never pass `filter->username`, `filter->keyword`, `opts.target`, or paths to shell without one of these.
+
+`plat_exec_capture` wraps the supplied command in `( ... )` before redirecting to the output file, so multi-clause commands (`cmd1 && cmd2`) capture all clauses, not just the last. Don't add output redirection of your own inside the cmd string.
 
 ### Logging
 

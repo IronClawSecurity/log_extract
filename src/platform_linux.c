@@ -131,7 +131,10 @@ int plat_exec_capture(const char *cmd, const char *output_file)
     char full_cmd[MAX_PATH_LEN * 2];
     int ret;
 
-    snprintf(full_cmd, sizeof(full_cmd), "%s > \"%s\" 2>&1", cmd, output_file);
+    /* Wrap in a subshell so that redirection binds to the entire command,
+     * not just the final clause of a `cmd1 && cmd2` chain. */
+    snprintf(full_cmd, sizeof(full_cmd), "( %s ) > \"%s\" 2>&1",
+             cmd, output_file);
     ret = system(full_cmd);
     if (ret == -1) return -1;
     return WEXITSTATUS(ret);

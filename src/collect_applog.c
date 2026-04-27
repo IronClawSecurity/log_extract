@@ -1,5 +1,6 @@
 #include "log_extract.h"
 #include "collectors/applog.h"
+#include "jsonl.h"
 #include <dirent.h>
 
 #ifdef __APPLE__
@@ -27,7 +28,7 @@ static const char *wellknown_dirs[] = {
 #endif
 
 static long collect_log_file(const char *path, const filter_config_t *filter,
-                             FILE *out)
+                             FILE *out, FILE *jsonl_f, const char *source_name)
 {
     FILE *in;
     char line[MAX_LINE_LEN];
@@ -39,6 +40,12 @@ static long collect_log_file(const char *path, const filter_config_t *filter,
     while (fgets(line, sizeof(line), in)) {
         if (!filter_match_line(filter, line)) continue;
         fputs(line, out);
+        if (jsonl_f) {
+            char trimmed[MAX_LINE_LEN];
+            snprintf(trimmed, sizeof(trimmed), "%s", line);
+            str_trim(trimmed);
+            jsonl_emit(jsonl_f, source_name, 0, -1, NULL, trimmed);
+        }
         count++;
     }
 
@@ -58,7 +65,7 @@ static long collect_directory(const char *dir_path, const filter_config_t *filte
 
     while ((ent = readdir(d)) != NULL) {
         char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
-        FILE *out;
+        FILE *out, *jsonl_f;
         long n;
 
         if (ent->d_name[0] == '.') continue;
@@ -73,8 +80,11 @@ static long collect_directory(const char *dir_path, const filter_config_t *filte
         out = fopen(dst, "w");
         if (!out) continue;
 
-        n = collect_log_file(src, filter, out);
+        jsonl_f = jsonl_open(out_dir, ent->d_name);
+
+        n = collect_log_file(src, filter, out, jsonl_f, ent->d_name);
         fclose(out);
+        jsonl_close(jsonl_f);
 
         if (n > 0) {
             total += n;
@@ -167,7 +177,7 @@ int collect_applog_run(collector_t *self)
         } else if (plat_file_exists(path)) {
             const char *basename = strrchr(path, PATH_SEP);
             char dst[MAX_PATH_LEN];
-            FILE *out;
+            FILE *out, *jsonl_f;
             long n;
 
             basename = basename ? basename + 1 : path;
@@ -179,8 +189,10 @@ int collect_applog_run(collector_t *self)
                 continue;
             }
 
-            n = collect_log_file(path, self->filter, out);
+            jsonl_f = jsonl_open(self->out_path, basename);
+            n = collect_log_file(path, self->filter, out, jsonl_f, basename);
             fclose(out);
+            jsonl_close(jsonl_f);
             if (n > 0) total += n;
             else if (n < 0) {
                 log_warn("app: cannot read %s", path);

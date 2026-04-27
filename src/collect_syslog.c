@@ -2,6 +2,7 @@
 
 #include "log_extract.h"
 #include "collectors/syslog.h"
+#include "jsonl.h"
 
 #ifdef __APPLE__
 static const char *syslog_paths[] = {
@@ -63,7 +64,7 @@ static int parse_syslog_severity(const char *line)
 }
 
 static long collect_text_file(const char *path, const filter_config_t *filter,
-                              FILE *out)
+                              FILE *out, FILE *jsonl_f, const char *source_name)
 {
     FILE *in;
     char line[MAX_LINE_LEN];
@@ -84,6 +85,12 @@ static long collect_text_file(const char *path, const filter_config_t *filter,
         if (!filter_match_line(filter, line)) continue;
 
         fputs(line, out);
+        if (jsonl_f) {
+            char trimmed[MAX_LINE_LEN];
+            snprintf(trimmed, sizeof(trimmed), "%s", line);
+            str_trim(trimmed);
+            jsonl_emit(jsonl_f, source_name, t, sev, NULL, trimmed);
+        }
         count++;
     }
 
@@ -203,14 +210,15 @@ int collect_syslog_run(collector_t *self)
 
     /* Collect text-based syslog files */
     for (i = 0; syslog_paths[i]; i++) {
+        const char *basename;
+        FILE *jsonl_f;
+        long n;
+
         if (!plat_file_exists(syslog_paths[i])) continue;
 
-        /* Name output file after source */
-        {
-            const char *basename = strrchr(syslog_paths[i], '/');
-            basename = basename ? basename + 1 : syslog_paths[i];
-            plat_path_join(out_file, sizeof(out_file), self->out_path, basename);
-        }
+        basename = strrchr(syslog_paths[i], '/');
+        basename = basename ? basename + 1 : syslog_paths[i];
+        plat_path_join(out_file, sizeof(out_file), self->out_path, basename);
 
         out = fopen(out_file, "w");
         if (!out) {
@@ -218,19 +226,21 @@ int collect_syslog_run(collector_t *self)
             continue;
         }
 
-        {
-            long n = collect_text_file(syslog_paths[i], self->filter, out);
-            fclose(out);
-            if (n < 0) {
-                log_warn("syslog: cannot read %s (permission denied?)",
-                         syslog_paths[i]);
-                self->status = 1;
-                snprintf(self->status_msg, sizeof(self->status_msg),
-                         "partial: could not read %s", syslog_paths[i]);
-            } else {
-                total += n;
-                log_verbose("syslog: %ld lines from %s", n, syslog_paths[i]);
-            }
+        jsonl_f = jsonl_open(self->out_path, basename);
+
+        n = collect_text_file(syslog_paths[i], self->filter, out, jsonl_f,
+                              basename);
+        fclose(out);
+        jsonl_close(jsonl_f);
+        if (n < 0) {
+            log_warn("syslog: cannot read %s (permission denied?)",
+                     syslog_paths[i]);
+            self->status = 1;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "partial: could not read %s", syslog_paths[i]);
+        } else {
+            total += n;
+            log_verbose("syslog: %ld lines from %s", n, syslog_paths[i]);
         }
     }
 

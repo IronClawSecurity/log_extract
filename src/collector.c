@@ -3,6 +3,8 @@
 #include "collectors/applog.h"
 #include "collectors/netlog.h"
 #include "collectors/filemon.h"
+#include "collectors/snapshot.h"
+#include "collectors/persistence.h"
 
 #ifndef _WIN32
 #include "collectors/syslog.h"
@@ -101,4 +103,12 @@ void collector_register_platform(collector_registry_t *reg)
     collector_register(reg, "filemon", "file modification logs", "filemon",
                        collect_filemon_init, collect_filemon_run,
                        collect_filemon_cleanup);
+
+    collector_register(reg, "snapshot", "live system state snapshot", "snapshot",
+                       collect_snapshot_init, collect_snapshot_run,
+                       collect_snapshot_cleanup);
+
+    collector_register(reg, "persistence", "persistence indicators", "persistence",
+                       collect_persistence_init, collect_persistence_run,
+                       collect_persistence_cleanup);
 }

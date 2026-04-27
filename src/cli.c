@@ -46,6 +46,10 @@ int cli_parse(int argc, char *argv[], cli_options_t *opts)
             opts->collect_network = 1; any_collector = 1;
         } else if (match_flag(arg, "-F", "--filemon")) {
             opts->collect_filemon = 1; any_collector = 1;
+        } else if (match_flag(arg, "-X", "--snapshot")) {
+            opts->collect_snapshot = 1; any_collector = 1;
+        } else if (match_flag(arg, "-R", "--persistence")) {
+            opts->collect_persistence = 1; any_collector = 1;
         } else if (match_flag(arg, "-a", "--all")) {
             opts->collect_all = 1;
         }
@@ -65,6 +69,11 @@ int cli_parse(int argc, char *argv[], cli_options_t *opts)
             if (!v) return -1;
             snprintf(opts->keyword, sizeof(opts->keyword), "%s", v);
             i++;
+        } else if (match_flag(arg, NULL, "--exclude")) {
+            const char *v = next_arg(argc, argv, i, arg);
+            if (!v) return -1;
+            snprintf(opts->exclude, sizeof(opts->exclude), "%s", v);
+            i++;
         } else if (match_flag(arg, NULL, "--level-min")) {
             const char *v = next_arg(argc, argv, i, arg);
             if (!v) return -1;
@@ -79,6 +88,18 @@ int cli_parse(int argc, char *argv[], cli_options_t *opts)
             const char *v = next_arg(argc, argv, i, arg);
             if (!v) return -1;
             snprintf(opts->username, sizeof(opts->username), "%s", v);
+            i++;
+        }
+        else if (match_flag(arg, NULL, "--fs-usage-secs")) {
+            const char *v = next_arg(argc, argv, i, arg);
+            if (!v) return -1;
+            opts->fs_usage_secs = atoi(v);
+            i++;
+        }
+        else if (match_flag(arg, NULL, "--target")) {
+            const char *v = next_arg(argc, argv, i, arg);
+            if (!v) return -1;
+            snprintf(opts->target, sizeof(opts->target), "%s", v);
             i++;
         }
         /* App log paths */
@@ -108,6 +129,8 @@ int cli_parse(int argc, char *argv[], cli_options_t *opts)
             opts->no_archive = 1;
         } else if (match_flag(arg, NULL, "--no-hash")) {
             opts->no_hash = 1;
+        } else if (match_flag(arg, NULL, "--jsonl")) {
+            opts->jsonl = 1;
         } else if (match_flag(arg, "-h", "--help")) {
             opts->show_help = 1;
             return 0;
@@ -139,18 +162,25 @@ void cli_print_usage(void)
     printf("  -P, --app            Application logs (IIS/Apache/nginx)\n");
     printf("  -N, --network        Network/firewall logs\n");
     printf("  -F, --filemon        File modification audit logs\n");
+    printf("  -X, --snapshot       Live process/network/system state snapshot\n");
+    printf("  -R, --persistence    Persistence indicators (autostarts, cron, etc.)\n");
     printf("  -a, --all            All collectors (default)\n");
     printf("\n");
     printf("Filters:\n");
     printf("  --from DATETIME      Start time, format: \"YYYY-MM-DD HH:MM:SS\"\n");
     printf("  --to   DATETIME      End time,   format: \"YYYY-MM-DD HH:MM:SS\"\n");
     printf("  --grep PATTERN       Include only lines matching pattern (substring)\n");
+    printf("  --exclude PATTERN    Drop lines matching pattern (applied after --grep)\n");
     printf("  --level-min N        Minimum severity (0=emergency .. 7=debug)\n");
     printf("  --level-max N        Maximum severity\n");
     printf("  --user USERNAME      Filter for specific user\n");
     printf("\n");
     printf("Application log paths:\n");
     printf("  --app-path PATH      Add a custom log file/directory (repeatable)\n");
+    printf("\n");
+    printf("Live capture / remote:\n");
+    printf("  --fs-usage-secs N    macOS only: run fs_usage for N seconds in filemon\n");
+    printf("  --target user@host   Run on remote host via ssh, fetch archive back\n");
     printf("\n");
     printf("Output:\n");
     printf("  -o, --output DIR     Output base directory (default: ./output)\n");
@@ -159,6 +189,7 @@ void cli_print_usage(void)
     printf("  --dry-run            Show what would be collected, don't collect\n");
     printf("  --no-archive         Skip archive creation\n");
     printf("  --no-hash            Skip SHA-256 hash of archive\n");
+    printf("  --jsonl              Emit a normalized .jsonl sidecar per source\n");
     printf("  -h, --help           Show this help message\n");
     printf("  --version            Show version\n");
     printf("\n");
@@ -185,6 +216,7 @@ void cli_to_filter(const cli_options_t *opts, filter_config_t *filter)
         filter->time_end = plat_parse_timestamp(opts->time_end);
 
     snprintf(filter->keyword, sizeof(filter->keyword), "%s", opts->keyword);
+    snprintf(filter->exclude, sizeof(filter->exclude), "%s", opts->exclude);
     filter->severity_min = opts->severity_min;
     filter->severity_max = opts->severity_max;
     snprintf(filter->username, sizeof(filter->username), "%s", opts->username);

@@ -5,7 +5,9 @@ LDFLAGS =
 # Common sources (compiled on all platforms)
 SRC_COMMON = src/main.c src/cli.c src/filter.c src/collector.c \
              src/collect_auth.c src/collect_applog.c src/collect_netlog.c \
-             src/collect_filemon.c src/hash.c src/util.c
+             src/collect_filemon.c src/collect_snapshot.c \
+             src/collect_persistence.c src/hash.c src/util.c \
+             src/manifest.c src/jsonl.c src/remote.c
 
 # Platform-specific sources
 ifeq ($(OS),Windows_NT)

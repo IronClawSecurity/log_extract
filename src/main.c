@@ -1,7 +1,11 @@
 #include "log_extract.h"
 #include "archive.h"
 #include "hash.h"
+#include "manifest.h"
+#include "jsonl.h"
+#include "remote.h"
 #include "collectors/applog.h"
+#include "collectors/filemon.h"
 
 applog_config_t g_applog_config;
 
@@ -22,6 +26,10 @@ static void enable_collectors(collector_registry_t *reg, const cli_options_t *op
             if (opts->collect_network && strcmp(c->name, "network") == 0)
                 c->enabled = 1;
             if (opts->collect_filemon && strcmp(c->name, "filemon") == 0)
+                c->enabled = 1;
+            if (opts->collect_snapshot && strcmp(c->name, "snapshot") == 0)
+                c->enabled = 1;
+            if (opts->collect_persistence && strcmp(c->name, "persistence") == 0)
                 c->enabled = 1;
         }
     }
@@ -114,6 +122,13 @@ int main(int argc, char *argv[])
     /* Apply global settings */
     g_verbose = opts.verbose;
     g_quiet = opts.quiet;
+    g_jsonl_enabled = opts.jsonl;
+    g_fs_usage_secs = opts.fs_usage_secs;
+
+    /* Remote-target mode: hand off entirely to remote.c, then exit. */
+    if (opts.target[0]) {
+        return remote_run(&opts, argc, argv);
+    }
 
     /* Set up app log config from CLI */
     memset(&g_applog_config, 0, sizeof(g_applog_config));
@@ -124,10 +139,12 @@ int main(int argc, char *argv[])
     /* Build filter */
     cli_to_filter(&opts, &filter);
 
-    /* Build output directory: base/hostname_timestamp/ */
+    /* Build output directory: base/hostname_timestamp/. Cap component widths
+     * so the snprintf provably fits — gcc's truncation analysis treats the
+     * buffer-sized inputs as worst-case. */
     plat_get_hostname(hostname, sizeof(hostname));
     plat_timestamp_now(timestamp, sizeof(timestamp));
-    snprintf(output_dir, sizeof(output_dir), "%s%c%s_%s",
+    snprintf(output_dir, sizeof(output_dir), "%.800s%c%.128s_%.62s",
              opts.output_dir, PATH_SEP, hostname, timestamp);
 
     /* Register collectors */
@@ -164,6 +181,11 @@ int main(int argc, char *argv[])
 
     if (!any_data) {
         log_warn("No data was collected from any source");
+    }
+
+    /* Manifest (written into output_dir before archive packs it) */
+    if (any_data) {
+        manifest_write(output_dir, &registry, &opts, argc, argv);
     }
 
     /* Archive */

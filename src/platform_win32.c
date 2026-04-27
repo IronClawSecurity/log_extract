@@ -103,7 +103,9 @@ int plat_exec_capture(const char *cmd, const char *output_file)
     char full_cmd[MAX_PATH_LEN * 2];
     int ret;
 
-    snprintf(full_cmd, sizeof(full_cmd), "%s > \"%s\" 2>&1", cmd, output_file);
+    /* Group command so that redirection binds to the whole sequence. */
+    snprintf(full_cmd, sizeof(full_cmd), "( %s ) > \"%s\" 2>&1",
+             cmd, output_file);
     ret = system(full_cmd);
     return ret;
 }

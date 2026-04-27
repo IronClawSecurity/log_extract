@@ -1,6 +1,8 @@
 #include "log_extract.h"
 #include "collectors/filemon.h"
 
+int g_fs_usage_secs = 0;
+
 #ifndef _WIN32
 
 #ifndef __APPLE__
@@ -140,6 +142,45 @@ int collect_filemon_run(collector_t *self)
             self->status = 1;
             snprintf(self->status_msg, sizeof(self->status_msg),
                      "partial: praudit failed");
+        }
+    }
+
+    /* macOS: optional live fs_usage capture (Endpoint Security alternative).
+     * Real ESF requires entitlements + signing, which is incompatible with a
+     * single drop-in binary. fs_usage is built-in on every macOS install and
+     * captures file/syscall events in real time. */
+    if (g_fs_usage_secs > 0 && plat_file_exists("/usr/bin/fs_usage")) {
+        char cmd[MAX_PATH_LEN * 2];
+        char out_file[MAX_PATH_LEN];
+        int ret;
+
+        plat_path_join(out_file, sizeof(out_file), self->out_path,
+                       "fs_usage.txt");
+
+        /* fs_usage runs until killed; wrap in `timeout` if available, else
+         * use a backgrounded sleep+kill pattern. coreutils gtimeout via brew
+         * is not assumed; we use perl one-liner which is universally present. */
+        snprintf(cmd, sizeof(cmd),
+                 "perl -e 'alarm shift; exec @ARGV' %d "
+                 "fs_usage -w -f filesys 2>/dev/null",
+                 g_fs_usage_secs);
+
+        log_info("filemon: capturing fs_usage for %d seconds...", g_fs_usage_secs);
+        log_verbose("filemon: %s", cmd);
+        ret = plat_exec_capture(cmd, out_file);
+        /* alarm-killed processes return non-zero; treat any output as success */
+        (void)ret;
+
+        {
+            FILE *f = fopen(out_file, "r");
+            if (f) {
+                char line[MAX_LINE_LEN];
+                long n = 0;
+                while (fgets(line, sizeof(line), f)) n++;
+                fclose(f);
+                total += n;
+                log_verbose("filemon: %ld lines from fs_usage", n);
+            }
         }
     }
 

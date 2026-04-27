@@ -1,5 +1,6 @@
 #include "log_extract.h"
 #include "collectors/auth.h"
+#include "jsonl.h"
 
 #ifndef _WIN32
 
@@ -59,7 +60,7 @@ static time_t parse_auth_time(const char *line)
 }
 
 static long collect_auth_text(const char *path, const filter_config_t *filter,
-                              FILE *out)
+                              FILE *out, FILE *jsonl_f, const char *src_name)
 {
     FILE *in;
     char line[MAX_LINE_LEN];
@@ -88,6 +89,12 @@ static long collect_auth_text(const char *path, const filter_config_t *filter,
 #endif
 
         fputs(line, out);
+        if (jsonl_f) {
+            char trimmed[MAX_LINE_LEN];
+            snprintf(trimmed, sizeof(trimmed), "%s", line);
+            str_trim(trimmed);
+            jsonl_emit(jsonl_f, src_name, t, -1, NULL, trimmed);
+        }
         count++;
     }
 
@@ -109,7 +116,7 @@ static const char *utmp_type_str(short type)
 }
 
 static long collect_wtmp(const char *path, const filter_config_t *filter,
-                         FILE *out)
+                         FILE *out, FILE *jsonl_f, const char *src_name)
 {
     FILE *in;
     struct utmpx entry;
@@ -139,6 +146,15 @@ static long collect_wtmp(const char *path, const filter_config_t *filter,
                 entry.ut_line,
                 entry.ut_host,
                 timebuf);
+        if (jsonl_f) {
+            char user[33], tty[33], host[257], msg[512];
+            snprintf(user, sizeof(user), "%s", entry.ut_user);
+            snprintf(tty, sizeof(tty), "%s", entry.ut_line);
+            snprintf(host, sizeof(host), "%s", entry.ut_host);
+            snprintf(msg, sizeof(msg), "%s tty=%s host=%s",
+                     utmp_type_str(entry.ut_type), tty, host);
+            jsonl_emit(jsonl_f, src_name, t, -1, user, msg);
+        }
         count++;
     }
 
@@ -201,7 +217,7 @@ int collect_auth_run(collector_t *self)
         {
             char out_file[MAX_PATH_LEN];
             const char *basename = strrchr(auth_log_paths[i], '/');
-            FILE *out;
+            FILE *out, *jsonl_f;
             long n;
 
             basename = basename ? basename + 1 : auth_log_paths[i];
@@ -213,8 +229,11 @@ int collect_auth_run(collector_t *self)
                 continue;
             }
 
-            n = collect_auth_text(auth_log_paths[i], self->filter, out);
+            jsonl_f = jsonl_open(self->out_path, basename);
+            n = collect_auth_text(auth_log_paths[i], self->filter, out,
+                                  jsonl_f, basename);
             fclose(out);
+            jsonl_close(jsonl_f);
 
             if (n < 0) {
                 log_warn("auth: cannot read %s (permission denied?)",
@@ -324,7 +343,7 @@ int collect_auth_run(collector_t *self)
     /* wtmp */
     if (plat_file_exists("/var/log/wtmp")) {
         char out_file[MAX_PATH_LEN];
-        FILE *out;
+        FILE *out, *jsonl_f;
         long n;
 
         plat_path_join(out_file, sizeof(out_file), self->out_path, "wtmp.txt");
@@ -334,8 +353,10 @@ int collect_auth_run(collector_t *self)
                     "TYPE", "USER", "TTY", "HOST", "TIME");
             fprintf(out, "%-12s %-8s %-12s %-16s %s\n",
                     "----", "----", "---", "----", "----");
-            n = collect_wtmp("/var/log/wtmp", self->filter, out);
+            jsonl_f = jsonl_open(self->out_path, "wtmp");
+            n = collect_wtmp("/var/log/wtmp", self->filter, out, jsonl_f, "wtmp");
             fclose(out);
+            jsonl_close(jsonl_f);
             if (n < 0) {
                 log_warn("auth: cannot read /var/log/wtmp");
             } else {
@@ -348,7 +369,7 @@ int collect_auth_run(collector_t *self)
     /* btmp (failed logins) */
     if (plat_file_exists("/var/log/btmp")) {
         char out_file[MAX_PATH_LEN];
-        FILE *out;
+        FILE *out, *jsonl_f;
         long n;
 
         plat_path_join(out_file, sizeof(out_file), self->out_path, "btmp.txt");
@@ -358,8 +379,10 @@ int collect_auth_run(collector_t *self)
                     "TYPE", "USER", "TTY", "HOST", "TIME");
             fprintf(out, "%-12s %-8s %-12s %-16s %s\n",
                     "----", "----", "---", "----", "----");
-            n = collect_wtmp("/var/log/btmp", self->filter, out);
+            jsonl_f = jsonl_open(self->out_path, "btmp");
+            n = collect_wtmp("/var/log/btmp", self->filter, out, jsonl_f, "btmp");
             fclose(out);
+            jsonl_close(jsonl_f);
             if (n < 0) {
                 log_warn("auth: cannot read /var/log/btmp (requires root)");
                 self->status = 1;
