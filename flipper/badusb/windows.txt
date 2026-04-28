@@ -1,0 +1,15 @@
+REM log_extract — Windows BadUSB payload for Flipper Zero
+REM Requires: Flipper firmware that exposes BadUSB + USB Mass Storage
+REM           (e.g. Momentum, Unleashed, RogueMaster).
+REM Assumes:  the Flipper SD card is labelled LOGXTRACT and run.bat sits
+REM           at its root alongside log_extract.exe.
+REM Behaviour: opens the Run dialog, locates the LOGXTRACT volume by label
+REM            via PowerShell, and launches run.bat elevated. The operator
+REM            must accept the UAC prompt — Windows event log collection
+REM            requires Administrator.
+
+DELAY 2000
+GUI r
+DELAY 800
+STRING powershell -NoProfile -WindowStyle Hidden -Command "$d=(Get-Volume -FileSystemLabel 'LOGXTRACT' | Select-Object -First 1).DriveLetter; if ($d) { Start-Process -Verb RunAs -FilePath ($d + ':\run.bat') }"
+ENTER

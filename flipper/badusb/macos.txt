@@ -1,0 +1,19 @@
+REM log_extract — macOS BadUSB payload for Flipper Zero
+REM Requires: Flipper firmware that exposes BadUSB + USB Mass Storage
+REM           (e.g. Momentum, Unleashed, RogueMaster).
+REM Assumes:  the Flipper SD card is labelled LOGXTRACT and run.sh sits
+REM           at its root alongside log_extract_macos.
+REM Behaviour: opens Spotlight, launches Terminal.app, and runs run.sh
+REM            under sudo from /Volumes/LOGXTRACT. The operator types the
+REM            sudo password at the terminal — `log show` system-scope
+REM            queries and several other macOS sources require root.
+
+DELAY 2000
+GUI SPACE
+DELAY 800
+STRING Terminal
+DELAY 800
+ENTER
+DELAY 2500
+STRING sudo sh /Volumes/LOGXTRACT/run.sh
+ENTER

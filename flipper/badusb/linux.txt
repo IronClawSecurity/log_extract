@@ -1,0 +1,16 @@
+REM log_extract — Linux BadUSB payload for Flipper Zero
+REM Requires: Flipper firmware that exposes BadUSB + USB Mass Storage
+REM           (e.g. Momentum, Unleashed, RogueMaster).
+REM Assumes:  the Flipper SD card is labelled LOGXTRACT and run.sh sits
+REM           at its root alongside log_extract_linux. The target has a
+REM           graphical desktop with Ctrl+Alt+T bound to a terminal.
+REM Behaviour: opens a terminal, resolves the LOGXTRACT mountpoint via
+REM            lsblk, and runs run.sh under sudo. The operator types the
+REM            sudo password at the terminal — most journald / auditd /
+REM            /var/log/auth.log collection paths need root.
+
+DELAY 2000
+CTRL ALT t
+DELAY 2500
+STRING m=$(lsblk -o LABEL,MOUNTPOINT -nr | awk '$1=="LOGXTRACT"{print $2; exit}'); if [ -n "$m" ]; then sudo sh "$m/run.sh"; else echo "LOGXTRACT volume not found"; fi
+ENTER
