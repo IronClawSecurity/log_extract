@@ -1,6 +1,7 @@
 #include "log_extract.h"
 #include "archive.h"
 #include "hash.h"
+#include "manifest.h"
 #include "collectors/applog.h"
 
 applog_config_t g_applog_config;
@@ -95,6 +96,8 @@ int main(int argc, char *argv[])
     char archive_path[MAX_PATH_LEN] = {0};
     char hash_hex[65] = {0};
     int i, any_data;
+    long long free_bytes;
+    time_t collect_start_utc, collect_end_utc;
 
     /* Parse CLI */
     if (cli_parse(argc, argv, &opts) != 0) {
@@ -127,8 +130,12 @@ int main(int argc, char *argv[])
     /* Build output directory: base/hostname_timestamp/ */
     plat_get_hostname(hostname, sizeof(hostname));
     plat_timestamp_now(timestamp, sizeof(timestamp));
-    snprintf(output_dir, sizeof(output_dir), "%s%c%s_%s",
-             opts.output_dir, PATH_SEP, hostname, timestamp);
+    if (snprintf(output_dir, sizeof(output_dir), "%s%c%s_%s",
+                 opts.output_dir, PATH_SEP, hostname, timestamp)
+            >= (int)sizeof(output_dir)) {
+        log_error("output directory path too long");
+        return 3;
+    }
 
     /* Register collectors */
     collector_registry_init(&registry);
@@ -149,8 +156,18 @@ int main(int argc, char *argv[])
 
     log_info("Output directory: %s", output_dir);
 
+    /* Disk-space guard: warn (don't abort) if the output filesystem is low.
+     * Queried after mkdir so the path is guaranteed to exist. */
+    free_bytes = plat_disk_free_bytes(output_dir);
+    if (free_bytes != -1 && free_bytes < 200LL * 1024 * 1024) {
+        log_warn("Low disk space on output location (%lld MB free); "
+                 "collection may fail", free_bytes / (1024 * 1024));
+    }
+
     /* Run collectors */
+    collect_start_utc = time(NULL);
     collector_registry_run_all(&registry, &filter, output_dir);
+    collect_end_utc = time(NULL);
 
     /* Check if any collector produced data */
     any_data = 0;
@@ -164,6 +181,16 @@ int main(int argc, char *argv[])
 
     if (!any_data) {
         log_warn("No data was collected from any source");
+    }
+
+    /* Manifest: written into output_dir before archiving so it is captured by
+     * the archive and covered by the outer archive hash. */
+    if (any_data) {
+        log_info("Writing collection manifest...");
+        if (manifest_write(output_dir, &registry,
+                           collect_start_utc, collect_end_utc) != 0) {
+            log_warn("Failed to write collection manifest; continuing");
+        }
     }
 
     /* Archive */

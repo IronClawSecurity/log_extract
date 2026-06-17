@@ -65,6 +65,14 @@ int plat_get_hostname(char *buf, size_t bufsz)
     return 0;
 }
 
+long long plat_disk_free_bytes(const char *path)
+{
+    ULARGE_INTEGER free_avail;
+    if (!GetDiskFreeSpaceExA(path, &free_avail, NULL, NULL))
+        return -1;
+    return (long long)free_avail.QuadPart;
+}
+
 time_t plat_parse_timestamp(const char *str)
 {
     struct tm tm;

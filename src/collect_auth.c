@@ -23,7 +23,78 @@ static const char *auth_log_paths[] = {
 };
 #endif
 
-/* Parse syslog-style timestamp from auth log line */
+/* Portable UTC epoch from a broken-down UTC time. timegm() is not in c99,
+ * so compute days-since-epoch by hand (proleptic Gregorian, fields normalized
+ * by the caller's ranges; year/mon/mday/h/m/s only). */
+static time_t tm_to_utc(const struct tm *tm)
+{
+    static const int mdays[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    int year = tm->tm_year + 1900;
+    int mon = tm->tm_mon;
+    long days = 0;
+    int y, m;
+
+    for (y = 1970; y < year; y++)
+        days += (((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 366 : 365);
+    for (m = 0; m < mon; m++) {
+        days += mdays[m];
+        if (m == 1 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
+            days += 1;
+    }
+    days += tm->tm_mday - 1;
+
+    return (time_t)days * 86400 + tm->tm_hour * 3600
+           + tm->tm_min * 60 + tm->tm_sec;
+}
+
+/* ISO-8601 at line start: "YYYY-MM-DD[ T]HH:MM:SS[.frac][Z|+/-HH:MM]".
+ * Returns UTC epoch honoring an explicit offset, or 0 if not ISO-8601. */
+static time_t parse_auth_time_iso(const char *line)
+{
+    struct tm tm;
+    int year, mon, mday, hour, min, sec, consumed;
+    time_t t;
+
+    memset(&tm, 0, sizeof(tm));
+    consumed = 0;
+    /* Accept either 'T' or space between date and time. */
+    if (sscanf(line, "%4d-%2d-%2d%*1[T ]%2d:%2d:%2d%n",
+               &year, &mon, &mday, &hour, &min, &sec, &consumed) != 6)
+        return 0;
+    if (consumed <= 0) return 0;
+    if (mon < 1 || mon > 12 || mday < 1 || mday > 31) return 0;
+
+    tm.tm_year = year - 1900;
+    tm.tm_mon = mon - 1;
+    tm.tm_mday = mday;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_sec = sec;
+
+    t = tm_to_utc(&tm);
+
+    /* Skip optional fractional seconds. */
+    {
+        const char *p = line + consumed;
+        if (*p == '.') {
+            p++;
+            while (*p >= '0' && *p <= '9') p++;
+        }
+        /* Honor explicit zone: 'Z' = UTC, +/-HH:MM = offset to subtract. */
+        if (*p == '+' || *p == '-') {
+            int sign = (*p == '+') ? 1 : -1;
+            int oh = 0, om = 0;
+            if (sscanf(p + 1, "%2d:%2d", &oh, &om) >= 1)
+                t -= (time_t)sign * (oh * 3600 + om * 60);
+        }
+        /* 'Z' or no zone: treat as already-UTC; nothing to adjust. */
+    }
+
+    return t;
+}
+
+/* Parse a timestamp from an auth log line. Tries ISO-8601 first, then the
+ * legacy syslog "Mon DD HH:MM:SS" (no year, assumes current local year). */
 static time_t parse_auth_time(const char *line)
 {
     struct tm tm;
@@ -35,6 +106,10 @@ static time_t parse_auth_time(const char *line)
     int i;
     time_t now;
     struct tm *now_tm;
+    time_t iso;
+
+    iso = parse_auth_time_iso(line);
+    if (iso) return iso;
 
     memset(&tm, 0, sizeof(tm));
     if (sscanf(line, "%3s %d %d:%d:%d", mon, &tm.tm_mday,
@@ -388,6 +463,9 @@ void collect_auth_cleanup(collector_t *self)
 
 #else /* _WIN32 */
 
+#include <windows.h>
+#include <winevt.h>
+
 int collect_auth_init(collector_t *self, const filter_config_t *filter,
                       const char *output_dir)
 {
@@ -401,11 +479,207 @@ int collect_auth_init(collector_t *self, const filter_config_t *filter,
     return 0;
 }
 
+/* Build XPath selecting logon-related Security EventIDs, AND-ing in absolute
+ * TimeCreated bounds when set. EventLog SystemTime is UTC, so gmtime is correct. */
+static void build_auth_xpath(wchar_t *buf, size_t bufsz,
+                             const filter_config_t *filter)
+{
+    wchar_t time_clause[512] = {0};
+    static const wchar_t *id_clause =
+        L"(EventID=4624 or EventID=4625 or EventID=4634 "
+        L"or EventID=4647 or EventID=4648)";
+
+    if (filter->time_start) {
+        struct tm *tm = gmtime(&filter->time_start);
+        if (tm) {
+            _snwprintf(time_clause + wcslen(time_clause),
+                512 - wcslen(time_clause),
+                L"%lsTimeCreated[@SystemTime>='%04d-%02d-%02dT%02d:%02d:%02d.000Z']",
+                time_clause[0] ? L" and " : L"",
+                tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                tm->tm_hour, tm->tm_min, tm->tm_sec);
+            /* MinGW _snwprintf may not NUL-terminate; the next wcslen relies on it. */
+            time_clause[(sizeof(time_clause)/sizeof(time_clause[0])) - 1] = L'\0';
+        }
+    }
+    if (filter->time_end) {
+        struct tm *tm = gmtime(&filter->time_end);
+        if (tm) {
+            _snwprintf(time_clause + wcslen(time_clause),
+                512 - wcslen(time_clause),
+                L"%lsTimeCreated[@SystemTime<='%04d-%02d-%02dT%02d:%02d:%02d.000Z']",
+                time_clause[0] ? L" and " : L"",
+                tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                tm->tm_hour, tm->tm_min, tm->tm_sec);
+            time_clause[(sizeof(time_clause)/sizeof(time_clause[0])) - 1] = L'\0';
+        }
+    }
+
+    if (time_clause[0])
+        _snwprintf(buf, bufsz, L"*[System[%ls and %ls]]", id_clause, time_clause);
+    else
+        _snwprintf(buf, bufsz, L"*[System[%ls]]", id_clause);
+    if (bufsz) buf[bufsz - 1] = L'\0';
+}
+
+/* Match TargetUserName/SubjectUserName in rendered event XML (mirrors
+ * event_matches_user in collect_eventlog.c). */
+static int auth_event_matches_user(const wchar_t *xml, const char *username)
+{
+    wchar_t wuser[128];
+    wchar_t pattern1[256], pattern2[256];
+
+    if (!username || !username[0]) return 1;
+
+    /* MultiByteToWideChar leaves the buffer unterminated when the source
+     * overflows it; force termination before any wcsstr/%ls read. */
+    MultiByteToWideChar(CP_UTF8, 0, username, -1, wuser, 128);
+    wuser[(sizeof(wuser)/sizeof(wuser[0])) - 1] = L'\0';
+
+    _snwprintf(pattern1, 255, L"TargetUserName'>%ls</Data", wuser);
+    pattern1[(sizeof(pattern1)/sizeof(pattern1[0])) - 1] = L'\0';
+    _snwprintf(pattern2, 255, L"SubjectUserName'>%ls</Data", wuser);
+    pattern2[(sizeof(pattern2)/sizeof(pattern2[0])) - 1] = L'\0';
+
+    return wcsstr(xml, pattern1) != NULL || wcsstr(xml, pattern2) != NULL;
+}
+
+static int auth_event_matches_keyword(const wchar_t *xml, const char *keyword)
+{
+    wchar_t wkw[256];
+
+    if (!keyword || !keyword[0]) return 1;
+
+    MultiByteToWideChar(CP_UTF8, 0, keyword, -1, wkw, 256);
+    wkw[(sizeof(wkw)/sizeof(wkw[0])) - 1] = L'\0';
+    return wcsstr(xml, wkw) != NULL;
+}
+
+/* Returns count of written events, or -1 on query failure. On
+ * ERROR_ACCESS_DENIED / ERROR_EVT_CHANNEL_NOT_FOUND sets *err for the caller. */
+static long query_security_auth(const filter_config_t *filter, FILE *out,
+                                DWORD *err_out)
+{
+    wchar_t xpath[1024];
+    EVT_HANDLE hResults;
+    EVT_HANDLE events[100];
+    DWORD returned, i;
+    long count = 0;
+    wchar_t *rendered = NULL;
+    DWORD rendered_sz = 0;
+    DWORD buf_used, prop_count;
+
+    *err_out = ERROR_SUCCESS;
+    build_auth_xpath(xpath, 1024, filter);
+
+    hResults = EvtQuery(NULL, L"Security", xpath,
+                        EvtQueryChannelPath | EvtQueryForwardDirection);
+    if (!hResults) {
+        *err_out = GetLastError();
+        return -1;
+    }
+
+    while (EvtNext(hResults, 100, events, INFINITE, 0, &returned)) {
+        for (i = 0; i < returned; i++) {
+            if (!EvtRender(NULL, events[i], EvtRenderEventXml,
+                           rendered_sz, rendered, &buf_used, &prop_count)) {
+                if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                    rendered_sz = buf_used;
+                    rendered = (wchar_t *)safe_realloc(rendered, rendered_sz);
+                    EvtRender(NULL, events[i], EvtRenderEventXml,
+                              rendered_sz, rendered, &buf_used, &prop_count);
+                } else {
+                    EvtClose(events[i]);
+                    continue;
+                }
+            }
+
+            if (!auth_event_matches_user(rendered, filter->username)) {
+                EvtClose(events[i]);
+                continue;
+            }
+            if (!auth_event_matches_keyword(rendered, filter->keyword)) {
+                EvtClose(events[i]);
+                continue;
+            }
+
+            {
+                int utf8_len = WideCharToMultiByte(CP_UTF8, 0, rendered, -1,
+                                                   NULL, 0, NULL, NULL);
+                if (utf8_len > 0) {
+                    char *utf8 = (char *)safe_malloc(utf8_len);
+                    WideCharToMultiByte(CP_UTF8, 0, rendered, -1,
+                                        utf8, utf8_len, NULL, NULL);
+                    fputs(utf8, out);
+                    fputs("\n", out);
+                    free(utf8);
+                    count++;
+                }
+            }
+
+            EvtClose(events[i]);
+        }
+    }
+
+    free(rendered);
+    EvtClose(hResults);
+    return count;
+}
+
 int collect_auth_run(collector_t *self)
 {
-    self->status = 2;
-    snprintf(self->status_msg, sizeof(self->status_msg),
-             "Windows auth collection not yet implemented");
+    char out_file[MAX_PATH_LEN];
+    FILE *out;
+    long n;
+    DWORD err = ERROR_SUCCESS;
+
+    plat_path_join(out_file, sizeof(out_file), self->out_path, "security_auth.xml");
+
+    out = fopen(out_file, "w");
+    if (!out) {
+        self->status = 3;
+        snprintf(self->status_msg, sizeof(self->status_msg),
+                 "cannot write to %.200s", out_file);
+        return 0;
+    }
+
+    fprintf(out, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Events>\n");
+    n = query_security_auth(self->filter, out, &err);
+    fprintf(out, "</Events>\n");
+    fclose(out);
+
+    if (n < 0) {
+        if (err == ERROR_ACCESS_DENIED) {
+            log_warn("auth: access denied to Security channel "
+                     "(run as Administrator)");
+            self->status = 1;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "partial: Security channel access denied "
+                     "(run as Administrator)");
+        } else if (err == ERROR_EVT_CHANNEL_NOT_FOUND) {
+            log_warn("auth: Security event log channel not found");
+            self->status = 2;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "Security channel not found");
+        } else {
+            log_warn("auth: failed to query Security channel (error %lu)",
+                     (unsigned long)err);
+            self->status = 1;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "partial: could not query Security channel");
+        }
+        return 0;
+    }
+
+    self->lines_collected = n;
+    log_verbose("auth: %ld logon events from Security channel", n);
+
+    if (n == 0 && self->status == 0) {
+        self->status = 2;
+        snprintf(self->status_msg, sizeof(self->status_msg),
+                 "no matching logon events");
+    }
+
     return 0;
 }
 

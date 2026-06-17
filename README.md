@@ -33,7 +33,9 @@ Designed for incident response and forensic investigations — deploy to a targe
 - **Severity filtering**: Filter by syslog severity / Windows event level
 - **Structured output**: Organized directory tree of collected logs
 - **Archive creation**: Automatic tar.gz (Linux) or zip (Windows) packaging
-- **Forensic integrity**: SHA-256 hash with sidecar file for chain-of-custody
+- **Forensic integrity**: SHA-256 hash with sidecar file for chain-of-custody, plus an in-archive `manifest.json` and `hashes.txt` covering every collected file
+- **Chain-of-custody manifest**: Per-file SHA-256/size/mtime and run metadata (tool/version/host/UTC start-end/timezone/privilege) written into each collection
+- **Disk-space guard**: Warns before collecting when the output filesystem has less than 200 MB free
 - **Zero dependencies**: Compiles to a single static binary, no runtime requirements
 - **Minimal footprint**: Small binary, runs without installation
 
@@ -75,7 +77,7 @@ Produces `log_extract.exe`.
 ### Windows (MSVC)
 
 ```cmd
-cl /Iinclude /Fe:log_extract.exe src\main.c src\cli.c src\filter.c src\collector.c src\collect_auth.c src\collect_applog.c src\collect_netlog.c src\collect_filemon.c src\hash.c src\util.c src\platform_win32.c src\collect_eventlog.c src\archive_win32.c /link wevtapi.lib advapi32.lib shlwapi.lib
+cl /Iinclude /Fe:log_extract.exe src\main.c src\cli.c src\filter.c src\collector.c src\collect_auth.c src\collect_applog.c src\collect_netlog.c src\collect_filemon.c src\hash.c src\manifest.c src\util.c src\platform_win32.c src\collect_eventlog.c src\archive_win32.c /link wevtapi.lib advapi32.lib shlwapi.lib
 ```
 
 ### Clean Build
@@ -181,13 +183,13 @@ Flags can be combined: `-S -A` collects system + auth logs only.
 
 ### Windows
 
-| Collector | Sources | Notes |
-|-----------|---------|-------|
-| System (`-S`) | Event Log: System, Application, Security channels | Uses Evt* API (Server 2008+); Security channel requires admin |
-| Auth (`-A`) | Security Event Log: EventIDs 4624, 4625, 4634, 4647, 4648 | Logon, failed logon, logoff events; user filter matches TargetUserName |
-| App (`-P`) | `C:\inetpub\logs\LogFiles\`, custom paths | Use `--app-path` for custom application logs |
-| Network (`-N`) | `C:\Windows\System32\LogFiles\Firewall\pfirewall.log`, Firewall event channel | Windows Firewall must be configured to log |
-| Filemon (`-F`) | Security Event Log: EventIDs 4663, 4656, 4660, 4670 | File access auditing must be enabled; user filter matches SubjectUserName |
+| Collector | Sources | Output | Notes |
+|-----------|---------|--------|-------|
+| System (`-S`) | Event Log: System, Application, Security channels | per-channel `.xml` | Uses Evt* API (Server 2008+); Security channel requires admin |
+| Auth (`-A`) | Security Event Log: EventIDs 4624, 4625, 4634, 4647, 4648 | `security_auth.xml` | Logon, failed logon, logoff, special-logon events; user filter matches TargetUserName/SubjectUserName in the rendered event XML |
+| App (`-P`) | `C:\inetpub\logs\LogFiles\`, custom paths | copied log files | Use `--app-path` for custom application logs |
+| Network (`-N`) | `C:\Windows\System32\LogFiles\Firewall\pfirewall.log` + the `Microsoft-Windows-Windows Firewall With Advanced Security/Firewall` event channel | `pfirewall.log`, `firewall_events.xml` | Windows Firewall must be configured to log; the text log and event channel are collected independently (either may be empty) |
+| Filemon (`-F`) | Security Event Log: EventIDs 4663, 4656, 4660, 4670 | `security_fileaudit.xml` | File access auditing must be enabled (object-access audit policy + SACLs); user filter matches SubjectUserName in the rendered event XML |
 
 ---
 
@@ -209,6 +211,8 @@ Filter logs to a specific window. Both `--from` and `--to` are optional and can 
 ```
 
 Timestamps are interpreted in local time.
+
+**Timestamp parsing.** For text logs (syslog, auth.log, etc.) the tool parses both modern ISO-8601 timestamps (`2026-04-27T15:30:45`, including a `Z`/`+HH:MM` offset, as written by recent systemd/rsyslog and journald `short-iso` output) and the legacy `Mon DD HH:MM:SS` syslog format. Lines whose timestamp cannot be parsed are **never dropped** — they are passed through, and a warning is emitted naming the source and how many lines were affected (e.g. `time filter could not be applied to N line(s) ... (unparseable timestamp; kept)`). Treat such a collection as potentially over-inclusive for the requested window. Windows event channels apply both `--from` and `--to` bounds server-side via the event query; journald/`log show` apply the window at the source.
 
 ### Keyword Search
 
@@ -233,6 +237,8 @@ Uses the syslog severity scale (0=emergency through 7=debug). On Windows, this m
 # Only warnings
 ./log_extract --level-min 4 --level-max 4
 ```
+
+**Where severity filtering applies.** Severity is only meaningful where the source carries a structured level: syslog/journald lines with a `<PRI>` field (Linux) and Windows event `Level` values (applied server-side in the event query). Raw text logs without a `<PRI>` field — most auth.log, application, and firewall text logs — have no parseable severity, so `--level-min`/`--level-max` cannot be enforced on them. In that case the matching lines are passed through and a warning is emitted naming the source (e.g. `--level-min/--level-max could not be applied to text source ... (no <PRI> severity ...)`), so an operator knows the severity window was not actually applied there.
 
 ### User-Specific Collection
 
@@ -272,6 +278,8 @@ output/
       kern_netfilter.log           # Kernel firewall entries
     filemon/
       audit.log                    # Filtered auditd entries
+    manifest.json                  # Run metadata + per-file hash/size/mtime
+    hashes.txt                     # sha256sum-format list of every collected file
   hostname_20260427_153045.tar.gz  # Compressed archive
   hostname_20260427_153045.tar.gz.sha256  # Hash sidecar
 ```
@@ -281,6 +289,23 @@ The `.sha256` file is in the standard checksum format and can be verified with:
 ```bash
 sha256sum -c hostname_20260427_153045.tar.gz.sha256
 ```
+
+### Integrity & Chain of Custody
+
+Every collection (whenever any data is gathered) writes two integrity files **inside** the output directory, so they are captured by the outer archive and themselves covered by the archive's `.sha256`:
+
+- **`hashes.txt`** — one line per collected file in `sha256sum` format (`<hex>  <relative/path>`). Paths are relative to the collection directory and use forward slashes so the file verifies portably on any platform. `manifest.json` and `hashes.txt` are excluded from the listing (they would otherwise hash themselves).
+- **`manifest.json`** — run metadata plus a `files` array with `path`, `size_bytes`, `sha256`, and `mtime_utc` for each collected file. Top-level fields include `tool`, `version`, `hostname`, `collected_start_utc` / `collected_end_utc` (the collector run window), `generated_utc`, `timezone_offset_seconds` (the collection host's local offset east of UTC, for interpreting local-time log entries), and `privilege` (`root`/`user` on Linux/macOS, `unknown` on Windows). All timestamps are UTC (`Z`-suffixed ISO-8601).
+
+To verify the per-file hashes after extracting the archive, run `sha256sum -c` from inside the collection directory:
+
+```bash
+tar xzf hostname_20260427_153045.tar.gz
+cd hostname_20260427_153045
+sha256sum -c hashes.txt
+```
+
+Every listed file should report `OK`. A `FAILED` line indicates the file was modified or truncated after collection. (On Windows, verify with any `sha256sum`-compatible tool, e.g. from Git for Windows or WSL.)
 
 ---
 
@@ -333,6 +358,8 @@ If run without sufficient privileges, the tool will warn about inaccessible sour
 - Use `--from` / `--to` to limit the time window
 - Use specific collector flags (`-A`, `-S`, etc.) to collect only what you need
 - Use `--no-archive` if you want to review the raw files before archiving
+
+Before collecting, the tool checks free space on the output filesystem. If less than **200 MB** is available it logs a warning (`Low disk space on output location (N MB free); collection may fail`) and **continues anyway** — the guard is advisory, not a hard abort, so a low-space target still produces whatever fits.
 
 ---
 
@@ -454,10 +481,13 @@ main.c
   |     +-- collect_filemon.c   File audit logs (both platforms)
   |
   +-- archive_linux.c / archive_win32.c   Archive creation
+  +-- manifest.c                           Per-file hashes + chain-of-custody manifest
   +-- hash.c                               SHA-256 integrity
-  +-- platform_linux.c / platform_win32.c  OS abstraction
+  +-- platform_linux.c / platform_win32.c  OS abstraction (incl. free-space query)
   +-- util.c                               Logging, memory, strings
 ```
+
+After all collectors run, `main.c` writes the manifest (`manifest.c`) into the collection directory, then archives and hashes it. The disk-space guard uses `plat_disk_free_bytes()` from the platform layer.
 
 Each collector implements three functions: `init`, `run`, and `cleanup`. Collectors are registered at startup and enabled/disabled based on CLI flags. Platform-specific code is isolated in separate `.c` files compiled conditionally.
 
