@@ -20,3 +20,7 @@ Thumbs.db
 # Distributable binaries and collection output (not source-controlled)
 dist/
 output/
+
+# Tracked release binaries (committed deliverables for all OS targets)
+!bin/
+!bin/*
