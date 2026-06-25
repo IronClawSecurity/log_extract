@@ -12,6 +12,9 @@ int  plat_file_exists(const char *path);
 int  plat_is_directory(const char *path);
 int  plat_get_hostname(char *buf, size_t bufsz);
 
+/* Free bytes on the filesystem containing path; -1 on error. */
+long long plat_disk_free_bytes(const char *path);
+
 /* Time helpers */
 time_t plat_parse_timestamp(const char *str);
 int    plat_format_timestamp(time_t t, char *buf, size_t bufsz);

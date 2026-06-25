@@ -16,3 +16,7 @@ log_extract.exe
 # OS
 .DS_Store
 Thumbs.db
+
+# Distributable binaries and collection output (not source-controlled)
+dist/
+output/

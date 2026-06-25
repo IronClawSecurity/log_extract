@@ -17,20 +17,47 @@ static const wchar_t *channels[] = {
 static void build_xpath(wchar_t *buf, size_t bufsz, const filter_config_t *filter)
 {
     /* Start with a basic query */
-    wchar_t time_clause[256] = {0};
+    wchar_t time_clause[512] = {0};
     wchar_t level_clause[128] = {0};
 
+    /* The TimeCreated predicate can carry both an inclusive lower (>=) and
+     * upper (<=) bound joined by 'and'; emit whichever bounds are set so the
+     * --to (time_end) limit is actually applied, not silently dropped. */
     if (filter->time_start || filter->time_end) {
-        /* Use timediff in milliseconds from now, or absolute SystemTime */
+        wchar_t start_bound[64] = {0};
+        wchar_t end_bound[64] = {0};
+
         if (filter->time_start) {
             struct tm *tm = gmtime(&filter->time_start);
             if (tm) {
-                _snwprintf(time_clause, 255,
-                    L"TimeCreated[@SystemTime>='%04d-%02d-%02dT%02d:%02d:%02d.000Z']",
+                _snwprintf(start_bound, 63,
+                    L"@SystemTime>='%04d-%02d-%02dT%02d:%02d:%02d.000Z'",
                     tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
                     tm->tm_hour, tm->tm_min, tm->tm_sec);
+                /* MinGW _snwprintf does not NUL-terminate on truncation. */
+                start_bound[(sizeof(start_bound)/sizeof(start_bound[0])) - 1] = L'\0';
             }
         }
+        if (filter->time_end) {
+            struct tm *tm = gmtime(&filter->time_end);
+            if (tm) {
+                _snwprintf(end_bound, 63,
+                    L"@SystemTime<='%04d-%02d-%02dT%02d:%02d:%02d.000Z'",
+                    tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                    tm->tm_hour, tm->tm_min, tm->tm_sec);
+                end_bound[(sizeof(end_bound)/sizeof(end_bound[0])) - 1] = L'\0';
+            }
+        }
+
+        if (start_bound[0] && end_bound[0]) {
+            _snwprintf(time_clause, 511, L"TimeCreated[%ls and %ls]",
+                       start_bound, end_bound);
+        } else if (start_bound[0]) {
+            _snwprintf(time_clause, 511, L"TimeCreated[%ls]", start_bound);
+        } else if (end_bound[0]) {
+            _snwprintf(time_clause, 511, L"TimeCreated[%ls]", end_bound);
+        }
+        time_clause[(sizeof(time_clause)/sizeof(time_clause[0])) - 1] = L'\0';
     }
 
     if (filter->severity_min != -1 || filter->severity_max != -1) {
@@ -38,6 +65,7 @@ static void build_xpath(wchar_t *buf, size_t bufsz, const filter_config_t *filte
         int lmax = filter->severity_max != -1 ? filter->severity_max : 5;
         /* Windows levels: 1=Critical, 2=Error, 3=Warning, 4=Information, 5=Verbose */
         _snwprintf(level_clause, 127, L"(Level>=%d and Level<=%d)", lmin, lmax);
+        level_clause[(sizeof(level_clause)/sizeof(level_clause[0])) - 1] = L'\0';
     }
 
     if (time_clause[0] && level_clause[0]) {
@@ -50,6 +78,8 @@ static void build_xpath(wchar_t *buf, size_t bufsz, const filter_config_t *filte
     } else {
         _snwprintf(buf, bufsz, L"*");
     }
+    /* Caller passes the true capacity in bufsz; guarantee termination. */
+    if (bufsz) buf[bufsz - 1] = L'\0';
 }
 
 /* Check if rendered event XML contains the target username */
@@ -60,10 +90,15 @@ static int event_matches_user(const wchar_t *xml, const char *username)
 
     if (!username || !username[0]) return 1;
 
+    /* MultiByteToWideChar does not NUL-terminate when the source overflows the
+     * fixed buffer; force termination before any wcsstr/%ls read. */
     MultiByteToWideChar(CP_UTF8, 0, username, -1, wuser, 128);
+    wuser[(sizeof(wuser)/sizeof(wuser[0])) - 1] = L'\0';
 
     _snwprintf(pattern1, 255, L"TargetUserName'>%ls</Data", wuser);
+    pattern1[(sizeof(pattern1)/sizeof(pattern1[0])) - 1] = L'\0';
     _snwprintf(pattern2, 255, L"SubjectUserName'>%ls</Data", wuser);
+    pattern2[(sizeof(pattern2)/sizeof(pattern2[0])) - 1] = L'\0';
 
     return wcsstr(xml, pattern1) != NULL || wcsstr(xml, pattern2) != NULL;
 }
@@ -76,6 +111,7 @@ static int event_matches_keyword(const wchar_t *xml, const char *keyword)
     if (!keyword || !keyword[0]) return 1;
 
     MultiByteToWideChar(CP_UTF8, 0, keyword, -1, wkw, 256);
+    wkw[(sizeof(wkw)/sizeof(wkw[0])) - 1] = L'\0';
     return wcsstr(xml, wkw) != NULL;
 }
 

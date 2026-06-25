@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -90,6 +91,14 @@ int plat_get_hostname(char *buf, size_t bufsz)
         return -1;
     }
     return 0;
+}
+
+long long plat_disk_free_bytes(const char *path)
+{
+    struct statvfs vfs;
+    if (statvfs(path, &vfs) != 0)
+        return -1;
+    return (long long)vfs.f_bavail * (long long)vfs.f_frsize;
 }
 
 time_t plat_parse_timestamp(const char *str)

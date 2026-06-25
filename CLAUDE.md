@@ -42,9 +42,9 @@ A collector communicates results back through fields on its own `collector_t` st
 Cross-platform code lives in common files. Platform-specific code is split three ways:
 - **Compile-time selection** in `Makefile`: Linux/macOS gets `platform_linux.c`, `collect_syslog.c`, `archive_linux.c`; Windows gets `platform_win32.c`, `collect_eventlog.c`, `archive_win32.c`
 - **`#ifdef _WIN32` / `#ifndef _WIN32` / `#ifdef __APPLE__`** inside collector files that are compiled on all platforms (auth, applog, netlog, filemon). These files have separate Linux, macOS, and Windows code paths in the same source file
-- **`platform.h` abstractions** (`plat_mkdir_p`, `plat_path_join`, `plat_exec_capture`, `plat_parse_timestamp`, etc.) so collector code doesn't directly call POSIX or Win32 APIs
+- **`platform.h` abstractions** (`plat_mkdir_p`, `plat_path_join`, `plat_exec_capture`, `plat_parse_timestamp`, `plat_disk_free_bytes`, etc.) so collector code doesn't directly call POSIX or Win32 APIs. `plat_disk_free_bytes()` (statvfs on Linux/macOS, `GetDiskFreeSpaceExA` on Windows) backs the pre-collection disk-space guard in `main.c`
 
-When extending a collector, keep these three paths in sync — do not add a feature on Linux without considering whether the macOS/Windows branches need an equivalent or an explicit "not implemented" stub (see `collect_auth.c` and `collect_filemon.c` Windows stubs as the pattern).
+When extending a collector, keep these three paths in sync — do not add a feature on Linux without considering whether the macOS/Windows branches need an equivalent or an explicit "not implemented" stub. The Windows branches of `collect_auth.c`, `collect_filemon.c`, and `collect_netlog.c` are now fully implemented (they query the Security / Firewall event channels via the Evt* API and the firewall text log), so they double as worked examples of a platform branch that does real work rather than stubbing out.
 
 ### Filter pipeline
 
@@ -54,7 +54,9 @@ The `--user` flag is interpreted differently per collector: text grep for syslog
 
 ### Output and packaging
 
-`main.c` builds the output path as `<opts.output_dir>/<hostname>_<timestamp>/`, then collectors write into `<that>/<collector.subdir>/`. After all collectors run, `archive_create()` packages the directory (tar.gz on Linux/macOS, zip on Windows) and `hash_sha256_file()` writes a `.sha256` sidecar.
+`main.c` builds the output path as `<opts.output_dir>/<hostname>_<timestamp>/`, then collectors write into `<that>/<collector.subdir>/`. The output flow in `main.c` is, in order: mkdir → disk-space guard (`plat_disk_free_bytes()`, warn-only below 200 MB) → run collectors (bracketed by `time(NULL)` calls to record the UTC collection window) → **`manifest_write()`** → `archive_create()` (tar.gz on Linux/macOS, zip on Windows) → `hash_sha256_file()` writes a `.sha256` sidecar. The manifest is written *before* archiving on purpose, so `manifest.json` and `hashes.txt` land inside the directory, get packed into the archive, and are covered by the archive's own outer hash.
+
+`src/manifest.c` (`manifest_write()`, declared in `include/manifest.h`) walks the finished output directory, computes a per-file SHA-256/size/mtime for every regular file (skipping `manifest.json`/`hashes.txt` so they never hash themselves), and emits two files: `hashes.txt` (sha256sum format, forward-slash relative paths for portable `sha256sum -c`) and `manifest.json` (tool/version/host/UTC start-end/`timezone_offset_seconds`/privilege plus the per-file array). It reuses `hash_sha256_file()` and does its own minimal RFC-8259 JSON escaping (`json_write_escaped`) — do not pull in a JSON library. It is built from on-disk reality, not from the collector registry (the `reg` argument is currently unused).
 
 The SHA-256 implementation in `src/hash.c` is a self-contained public-domain implementation — there is no OpenSSL or other crypto dependency. Don't replace it with a system call.
 

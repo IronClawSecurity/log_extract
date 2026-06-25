@@ -281,6 +281,86 @@ void collect_filemon_cleanup(collector_t *self)
 
 #else /* _WIN32 */
 
+#include <windows.h>
+#include <winevt.h>
+
+/* File-access audit EventIDs: 4663=access attempt, 4656=handle requested,
+ * 4660=object deleted, 4670=permissions changed. These live in Security. */
+static void build_fileaudit_xpath(wchar_t *buf, size_t bufsz,
+                                  const filter_config_t *filter)
+{
+    wchar_t time_clause[512] = {0};
+
+    if (filter->time_start) {
+        struct tm *tm = gmtime(&filter->time_start);
+        if (tm) {
+            _snwprintf(time_clause, 255,
+                L"TimeCreated[@SystemTime>='%04d-%02d-%02dT%02d:%02d:%02d.000Z']",
+                tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                tm->tm_hour, tm->tm_min, tm->tm_sec);
+            /* MinGW _snwprintf may not NUL-terminate; wcscat/[0] read this. */
+            time_clause[(sizeof(time_clause)/sizeof(time_clause[0])) - 1] = L'\0';
+        }
+    }
+    if (filter->time_end) {
+        struct tm *tm = gmtime(&filter->time_end);
+        if (tm) {
+            wchar_t end_clause[256];
+            _snwprintf(end_clause, 255,
+                L"TimeCreated[@SystemTime<='%04d-%02d-%02dT%02d:%02d:%02d.000Z']",
+                tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                tm->tm_hour, tm->tm_min, tm->tm_sec);
+            end_clause[(sizeof(end_clause)/sizeof(end_clause[0])) - 1] = L'\0';
+            if (time_clause[0]) {
+                wcscat(time_clause, L" and ");
+                wcscat(time_clause, end_clause);
+            } else {
+                wcscpy(time_clause, end_clause);
+            }
+        }
+    }
+
+    if (time_clause[0]) {
+        _snwprintf(buf, bufsz,
+            L"*[System[(EventID=4663 or EventID=4656 or EventID=4660 or "
+            L"EventID=4670) and %ls]]", time_clause);
+    } else {
+        _snwprintf(buf, bufsz,
+            L"*[System[(EventID=4663 or EventID=4656 or EventID=4660 or "
+            L"EventID=4670)]]");
+    }
+    if (bufsz) buf[bufsz - 1] = L'\0';
+}
+
+/* --user matches the actor on the audited handle via SubjectUserName. */
+static int event_matches_user(const wchar_t *xml, const char *username)
+{
+    wchar_t wuser[128];
+    wchar_t pattern[256];
+
+    if (!username || !username[0]) return 1;
+
+    /* MultiByteToWideChar leaves the buffer unterminated when the source
+     * overflows it; force termination before any wcsstr/%ls read. */
+    MultiByteToWideChar(CP_UTF8, 0, username, -1, wuser, 128);
+    wuser[(sizeof(wuser)/sizeof(wuser[0])) - 1] = L'\0';
+    _snwprintf(pattern, 255, L"SubjectUserName'>%ls</Data", wuser);
+    pattern[(sizeof(pattern)/sizeof(pattern[0])) - 1] = L'\0';
+
+    return wcsstr(xml, pattern) != NULL;
+}
+
+static int event_matches_keyword(const wchar_t *xml, const char *keyword)
+{
+    wchar_t wkw[256];
+
+    if (!keyword || !keyword[0]) return 1;
+
+    MultiByteToWideChar(CP_UTF8, 0, keyword, -1, wkw, 256);
+    wkw[(sizeof(wkw)/sizeof(wkw[0])) - 1] = L'\0';
+    return wcsstr(xml, wkw) != NULL;
+}
+
 int collect_filemon_init(collector_t *self, const filter_config_t *filter,
                          const char *output_dir)
 {
@@ -296,9 +376,108 @@ int collect_filemon_init(collector_t *self, const filter_config_t *filter,
 
 int collect_filemon_run(collector_t *self)
 {
-    self->status = 2;
-    snprintf(self->status_msg, sizeof(self->status_msg),
-             "Windows file audit collection not yet implemented");
+    long total = 0;
+    wchar_t xpath[1024];
+    EVT_HANDLE hResults;
+    EVT_HANDLE events[100];
+    DWORD returned, i;
+    wchar_t *rendered = NULL;
+    DWORD rendered_sz = 0;
+    DWORD buf_used, prop_count;
+    char out_file[MAX_PATH_LEN];
+    FILE *out;
+
+    build_fileaudit_xpath(xpath, 1024, self->filter);
+
+    hResults = EvtQuery(NULL, L"Security", xpath,
+                        EvtQueryChannelPath | EvtQueryForwardDirection);
+    if (!hResults) {
+        DWORD err = GetLastError();
+        if (err == ERROR_EVT_CHANNEL_NOT_FOUND) {
+            self->status = 2;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "Security channel not found");
+        } else if (err == ERROR_ACCESS_DENIED) {
+            log_warn("filemon: access denied (run as Administrator; file-access "
+                     "auditing must be enabled via audit policy)");
+            self->status = 1;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "access denied: run as Administrator and enable file-access "
+                     "audit policy");
+        } else {
+            self->status = 3;
+            snprintf(self->status_msg, sizeof(self->status_msg),
+                     "EvtQuery failed (error %lu)", (unsigned long)err);
+        }
+        return 0;
+    }
+
+    plat_path_join(out_file, sizeof(out_file), self->out_path,
+                   "security_fileaudit.xml");
+    out = fopen(out_file, "w");
+    if (!out) {
+        EvtClose(hResults);
+        self->status = 3;
+        snprintf(self->status_msg, sizeof(self->status_msg),
+                 "cannot write output file");
+        return 0;
+    }
+
+    fprintf(out, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Events>\n");
+
+    while (EvtNext(hResults, 100, events, INFINITE, 0, &returned)) {
+        for (i = 0; i < returned; i++) {
+            if (!EvtRender(NULL, events[i], EvtRenderEventXml,
+                           rendered_sz, rendered, &buf_used, &prop_count)) {
+                if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                    rendered_sz = buf_used;
+                    rendered = (wchar_t *)safe_realloc(rendered, rendered_sz);
+                    EvtRender(NULL, events[i], EvtRenderEventXml,
+                              rendered_sz, rendered, &buf_used, &prop_count);
+                } else {
+                    EvtClose(events[i]);
+                    continue;
+                }
+            }
+
+            if (!event_matches_user(rendered, self->filter->username)) {
+                EvtClose(events[i]);
+                continue;
+            }
+            if (!event_matches_keyword(rendered, self->filter->keyword)) {
+                EvtClose(events[i]);
+                continue;
+            }
+
+            {
+                int utf8_len = WideCharToMultiByte(CP_UTF8, 0, rendered, -1,
+                                                    NULL, 0, NULL, NULL);
+                if (utf8_len > 0) {
+                    char *utf8 = (char *)safe_malloc(utf8_len);
+                    WideCharToMultiByte(CP_UTF8, 0, rendered, -1,
+                                       utf8, utf8_len, NULL, NULL);
+                    fputs(utf8, out);
+                    fputs("\n", out);
+                    free(utf8);
+                    total++;
+                }
+            }
+
+            EvtClose(events[i]);
+        }
+    }
+
+    fprintf(out, "</Events>\n");
+    fclose(out);
+    free(rendered);
+    EvtClose(hResults);
+
+    self->lines_collected = total;
+    if (total == 0 && self->status == 0) {
+        self->status = 2;
+        snprintf(self->status_msg, sizeof(self->status_msg), "no matching events");
+    }
+
     return 0;
 }
 
